@@ -7,9 +7,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 import asyncio
 import urllib.parse
+import time
 
-# --- CÓDIGO PARA MANTER ONLINE NO RENDER ---
-class HealthCheckHandler(BaseHTTPRequestHandler ):
+# --- CÓDIGO PARA MANTER ONLINE NO RENDER (ANTI-SONO ) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
@@ -23,7 +24,7 @@ def run_health_check():
     server.serve_forever()
 
 threading.Thread(target=run_health_check, daemon=True).start()
-# -------------------------------------------
+# -------------------------------------------------------
 
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -68,11 +69,29 @@ def get_one_account_from_stock(product_id):
         return account
     return None
 
-# --- Autocomplete para Produtos ---
-async def get_products_autocomplete(ctx: discord.AutocompleteContext):
-    return [pid for pid in PRODUCTS.keys() if ctx.value.lower() in pid.lower()]
+# --- Modal para Estoque Artificial ---
+class ArtificialStockModal(Modal):
+    def __init__(self, product_id, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs, title="Criar Estoque Artificial")
+        self.product_id = product_id
+        self.add_item(TextInput(label="Texto do Item (ex: login:senha ou link)", placeholder="Cole aqui o que o cliente vai receber", required=True))
+        self.add_item(TextInput(label="Quantidade de Vezes", placeholder="Ex: 100", required=True))
 
-# --- Classes de Interface ---
+    async def callback(self, interaction: discord.Interaction):
+        texto = self.children[0].value
+        try:
+            quantidade = int(self.children[1].value)
+            if quantidade <= 0: raise ValueError
+        except:
+            return await interaction.response.send_message("❌ Quantidade inválida! Use apenas números positivos.", ephemeral=True)
+        
+        current_stock = load_stock(self.product_id)
+        new_stock = current_stock + ([texto] * quantidade)
+        save_stock(self.product_id, new_stock)
+        
+        await interaction.response.send_message(f"✅ Sucesso! Adicionado **{quantidade}** itens ao estoque de **{PRODUCTS[self.product_id]['name']}**.", ephemeral=True)
+
+# --- Classes de Interface de Vendas ---
 class ProductModal(Modal):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs, title="Configurar Novo Produto")
@@ -89,7 +108,7 @@ class ProductModal(Modal):
         product_id = name.lower().replace(" ", "-")
         PRODUCTS[product_id] = {"name": name, "description": description, "price": price}
         save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Produto **{name}** criado! ID: `{product_id}`. Use `/criarproduto` para enviar o menu.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Produto criado! ID: `{product_id}`.", ephemeral=True)
 
 class AddStockModal(Modal):
     def __init__(self, product_id, *args, **kwargs) -> None:
@@ -139,7 +158,6 @@ class SalesMainView(View):
             async def sel_callback(i): await self.show_payment(i, select.values[0])
             select.callback = sel_callback
             v = View(); v.add_item(select); return await interaction.response.send_message("Selecione:", view=v, ephemeral=True)
-        
         await self.show_payment(interaction, pid)
 
     async def show_payment(self, interaction, pid):
@@ -193,19 +211,32 @@ async def criarproduto(ctx):
     else: await ctx.respond("Loja vazia! Use o botão ⚙️ para criar um produto.", view=SalesMainView())
 
 @bot.slash_command(name="estoque_artificial", description="Adiciona itens repetidos ao estoque")
-async def estoque_artificial(
-    ctx, 
-    produto: discord.Option(str, "Escolha o produto", autocomplete=get_products_autocomplete),
-    texto: discord.Option(str, "Texto que será entregue (ex: link ou conta)"),
-    quantidade: discord.Option(int, "Quantas vezes adicionar", min_value=1, max_value=1000)
-):
+async def estoque_artificial(ctx):
     if ctx.author.id != bot.owner_id: return await ctx.respond("Apenas o dono!", ephemeral=True)
-    if produto not in PRODUCTS: return await ctx.respond("Produto não encontrado!", ephemeral=True)
+    if not PRODUCTS: return await ctx.respond("Crie um produto primeiro!", ephemeral=True)
     
-    save_stock(produto, load_stock(produto) + ([texto] * quantidade))
-    await ctx.respond(f"✅ Adicionado {quantidade} vezes o item ao estoque de **{PRODUCTS[produto]['name']}**!", ephemeral=True)
+    options = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
+    select = Select(placeholder="Escolha o produto para o estoque artificial...", options=options)
+    
+    async def select_callback(interaction: discord.Interaction):
+        await interaction.response.send_modal(ArtificialStockModal(select.values[0]))
+    
+    select.callback = select_callback
+    view = View(); view.add_item(select)
+    await ctx.respond("Selecione o produto que deseja abastecer:", view=view, ephemeral=True)
 
 @bot.event
 async def on_connect(): await bot.sync_commands()
 
-if DISCORD_BOT_TOKEN: bot.run(DISCORD_BOT_TOKEN)
+# Função de Auto-Restart
+def start_bot():
+    while True:
+        try:
+            print("Iniciando Bot...")
+            bot.run(DISCORD_BOT_TOKEN)
+        except Exception as e:
+            print(f"Erro: {e}. Reiniciando em 10s...")
+            time.sleep(10)
+
+if DISCORD_BOT_TOKEN:
+    start_bot()
