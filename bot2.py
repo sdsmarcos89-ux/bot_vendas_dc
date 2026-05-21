@@ -74,69 +74,63 @@ class ArtificialStockModal(Modal):
     def __init__(self, product_id, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs, title="Criar Estoque Artificial")
         self.product_id = product_id
-        self.add_item(TextInput(label="Texto do Item (ex: login:senha ou link)", placeholder="Cole aqui o que o cliente vai receber", required=True))
-        self.add_item(TextInput(label="Quantidade de Vezes", placeholder="Ex: 100", required=True))
+        self.add_item(TextInput(label="Texto do Item", placeholder="O que o cliente vai receber", required=True))
+        self.add_item(TextInput(label="Quantidade", placeholder="Ex: 100", required=True))
 
     async def callback(self, interaction: discord.Interaction):
         texto = self.children[0].value
         try:
             quantidade = int(self.children[1].value)
             if quantidade <= 0: raise ValueError
-        except:
-            return await interaction.response.send_message("❌ Quantidade inválida! Use apenas números positivos.", ephemeral=True)
-        
-        current_stock = load_stock(self.product_id)
-        new_stock = current_stock + ([texto] * quantidade)
-        save_stock(self.product_id, new_stock)
-        
-        await interaction.response.send_message(f"✅ Sucesso! Adicionado **{quantidade}** itens ao estoque de **{PRODUCTS[self.product_id]['name']}**.", ephemeral=True)
+        except: return await interaction.response.send_message("❌ Quantidade inválida!", ephemeral=True)
+        save_stock(self.product_id, load_stock(self.product_id) + ([texto] * quantidade))
+        await interaction.response.send_message(f"✅ Adicionado **{quantidade}** itens ao estoque de **{PRODUCTS[self.product_id]['name']}**.", ephemeral=True)
 
-# --- Classes de Interface de Vendas ---
+# --- Classes de Interface ---
 class ProductModal(Modal):
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="Configurar Novo Produto")
-        self.add_item(TextInput(label="Título do Produto", placeholder="Ex: Conta Valorant Bronze", required=True))
-        self.add_item(TextInput(label="Descrição Detalhada", placeholder="Skins: Vandal Saqueadora...", style=discord.InputTextStyle.long, required=True))
-        self.add_item(TextInput(label="Preço (Apenas números)", placeholder="49.90", required=True))
+        super().__init__(*args, **kwargs, title="Novo Produto")
+        self.add_item(TextInput(label="Título", placeholder="Ex: Conta Valorant", required=True))
+        self.add_item(TextInput(label="Descrição", style=discord.InputTextStyle.long, required=True))
+        self.add_item(TextInput(label="Preço", placeholder="49.90", required=True))
 
     async def callback(self, interaction: discord.Interaction):
         name = self.children[0].value
-        description = self.children[1].value
+        desc = self.children[1].value
         try: price = float(self.children[2].value.replace(",", "."))
         except: return await interaction.response.send_message("❌ Valor inválido!", ephemeral=True)
-        
-        product_id = name.lower().replace(" ", "-")
-        PRODUCTS[product_id] = {"name": name, "description": description, "price": price}
+        pid = name.lower().replace(" ", "-")
+        PRODUCTS[pid] = {"name": name, "description": desc, "price": price}
         save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Produto criado! ID: `{product_id}`.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Produto **{name}** criado!", ephemeral=True)
 
 class AddStockModal(Modal):
     def __init__(self, product_id, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs, title="Abastecer Estoque")
         self.product_id = product_id
-        self.add_item(TextInput(label="Contas (uma por linha)", placeholder="login:senha", style=discord.InputTextStyle.long, required=True))
+        self.add_item(TextInput(label="Contas (uma por linha)", style=discord.InputTextStyle.long, required=True))
 
     async def callback(self, interaction: discord.Interaction):
-        new_accounts = [line.strip() for line in self.children[0].value.split("\n") if line.strip()]
-        save_stock(self.product_id, load_stock(self.product_id) + new_accounts)
-        await interaction.response.send_message(f"✅ {len(new_accounts)} contas adicionadas!", ephemeral=True)
+        new = [line.strip() for line in self.children[0].value.split("\n") if line.strip()]
+        save_stock(self.product_id, load_stock(self.product_id) + new)
+        await interaction.response.send_message(f"✅ {len(new)} contas adicionadas!", ephemeral=True)
 
 class ApprovalView(View):
     def __init__(self, buyer_id, product_id, product_name):
         super().__init__(timeout=None)
         self.buyer_id, self.product_id, self.product_name = buyer_id, product_id, product_name
 
-    @discord.ui.button(label="✅ Aprovar Pagamento", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.success)
     async def approve(self, button, interaction):
-        account = get_one_account_from_stock(self.product_id)
-        if account:
+        acc = get_one_account_from_stock(self.product_id)
+        if acc:
             try:
                 buyer = await bot.fetch_user(self.buyer_id)
-                await buyer.send(f"✨ **Pagamento Confirmado!**\nSua compra de **{self.product_name}** foi entregue.\n\n🔑 **Dados da Conta:**\n`{account}`")
-                await interaction.response.send_message(f"✅ Venda entregue para <@{self.buyer_id}>!", ephemeral=False)
+                await buyer.send(f"✨ **Entrega Efetuada!**\nProduto: **{self.product_name}**\n\n🔑 **Dados:**\n`{acc}`")
+                await interaction.response.send_message(f"✅ Entregue para <@{self.buyer_id}>!", ephemeral=False)
                 await interaction.message.edit(view=None)
-            except: await interaction.response.send_message("❌ DM do comprador fechada!", ephemeral=True)
-        else: await interaction.response.send_message("❌ Estoque acabou!", ephemeral=True)
+            except: await interaction.response.send_message("❌ DM fechada!", ephemeral=True)
+        else: await interaction.response.send_message("❌ Sem estoque!", ephemeral=True)
 
     @discord.ui.button(label="❌ Recusar", style=discord.ButtonStyle.danger)
     async def deny(self, button, interaction):
@@ -152,42 +146,42 @@ class SalesMainView(View):
     async def buy(self, button, interaction):
         pid = self.product_id
         if not pid:
-            options = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items() if get_available_stock_count(pid) > 0]
-            if not options: return await interaction.response.send_message("Sem estoque!", ephemeral=True)
-            select = Select(placeholder="Escolha o produto...", options=options)
-            async def sel_callback(i): await self.show_payment(i, select.values[0])
-            select.callback = sel_callback
-            v = View(); v.add_item(select); return await interaction.response.send_message("Selecione:", view=v, ephemeral=True)
+            opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items() if get_available_stock_count(pid) > 0]
+            if not opts: return await interaction.response.send_message("Sem estoque!", ephemeral=True)
+            sel = Select(placeholder="Escolha o produto...", options=opts)
+            async def sel_cb(i): await self.show_payment(i, sel.values[0])
+            sel.callback = sel_cb
+            v = View(); v.add_item(sel); return await interaction.response.send_message("Selecione:", view=v, ephemeral=True)
         await self.show_payment(interaction, pid)
 
     async def show_payment(self, interaction, pid):
         p = PRODUCTS[pid]
-        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={urllib.parse.quote(PIX_KEY )}"
-        embed = discord.Embed(title="⚡ Pagamento Pendente", description=f"Comprando: **{p['name']}**", color=0xf1c40f)
-        embed.add_field(name="💰 Valor", value=f"```R$ {p['price']:.2f}```", inline=False)
-        embed.add_field(name="🔑 Chave PIX", value=f"```\n{PIX_KEY}\n```", inline=False)
-        embed.set_image(url=qr_url)
+        qr = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={urllib.parse.quote(PIX_KEY )}"
+        emb = discord.Embed(title="⚡ Pagamento", description=f"Produto: **{p['name']}**", color=0xf1c40f)
+        emb.add_field(name="💰 Valor", value=f"```R$ {p['price']:.2f}```", inline=False)
+        emb.add_field(name="🔑 Chave PIX", value=f"```\n{PIX_KEY}\n```", inline=False)
+        emb.set_image(url=qr)
         btn = Button(label="✅ Já realizei o PIX", style=discord.ButtonStyle.success)
-        async def paid_callback(i):
-            admin_chan = bot.get_channel(ADMIN_CHANNEL_ID)
-            if admin_chan:
-                await admin_chan.send(f"🚨 **ALERTA DE VENDA**\n<@{i.user.id}> afirma ter pago **R${p['price']:.2f}** por **{p['name']}**.", view=ApprovalView(i.user.id, pid, p['name']))
-                await i.response.send_message("✅ Notificação enviada! Aguarde a conferência.", ephemeral=True)
+        async def paid_cb(i):
+            chan = bot.get_channel(ADMIN_CHANNEL_ID)
+            if chan:
+                await chan.send(f"🚨 **VENDA PENDENTE**\n<@{i.user.id}> pagou **R${p['price']:.2f}** por **{p['name']}**.", view=ApprovalView(i.user.id, pid, p['name']))
+                await i.response.send_message("✅ Notificado! Aguarde a entrega na DM.", ephemeral=True)
             else: await i.response.send_message("❌ Erro: Canal Admin não configurado.", ephemeral=True)
-        btn.callback = paid_callback
+        btn.callback = paid_cb
         v = View(); v.add_item(btn)
-        await interaction.response.send_message(embed=embed, view=v, ephemeral=True)
+        await interaction.response.send_message(embed=emb, view=v, ephemeral=True)
 
     @discord.ui.button(label="⚙️", style=discord.ButtonStyle.secondary, custom_id="admin_btn")
     async def admin(self, button, interaction):
         if interaction.user.id != bot.owner_id: return await interaction.response.send_message("Apenas o dono!", ephemeral=True)
         v = View()
-        b1 = Button(label="➕ Criar Produto", style=discord.ButtonStyle.success)
+        b1 = Button(label="➕ Novo Produto", style=discord.ButtonStyle.success)
         b1.callback = lambda i: i.response.send_modal(ProductModal())
-        b2 = Button(label="📦 Abastecer Estoque", style=discord.ButtonStyle.primary)
+        b2 = Button(label="📦 Estoque", style=discord.ButtonStyle.primary)
         async def b2_c(i):
             opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-            if not opts: return await i.response.send_message("Crie um produto primeiro!", ephemeral=True)
+            if not opts: return await i.response.send_message("Crie um produto!", ephemeral=True)
             s = Select(options=opts); s.callback = lambda i2: i2.response.send_modal(AddStockModal(s.values[0]))
             v2 = View(); v2.add_item(s); await i.response.send_message("Selecione:", view=v2, ephemeral=True)
         b2.callback = b2_c
@@ -196,47 +190,48 @@ class SalesMainView(View):
 
 @bot.event
 async def on_ready():
-    print(f"Bot Profissional Online: {bot.user}")
+    print(f"Bot Online: {bot.user}")
     bot.add_view(SalesMainView())
 
-@bot.slash_command(name="criarproduto", description="Envia o menu de vendas profissional")
+@bot.slash_command(name="criarproduto", description="Envia a vitrine do primeiro produto")
 async def criarproduto(ctx):
     if PRODUCTS:
         pid = list(PRODUCTS.keys())[0]
         p = PRODUCTS[pid]
-        embed = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
-        embed.add_field(name="💰 Valor", value=f"```R$ {p['price']:.2f}```", inline=True)
-        embed.add_field(name="📦 Estoque", value=f"``` {get_available_stock_count(pid)} unidades ```", inline=True)
-        await ctx.respond(embed=embed, view=SalesMainView(pid))
-    else: await ctx.respond("Loja vazia! Use o botão ⚙️ para criar um produto.", view=SalesMainView())
+        emb = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
+        emb.add_field(name="💰 Valor", value=f"```R$ {p['price']:.2f}```", inline=True)
+        emb.add_field(name="📦 Estoque", value=f"``` {get_available_stock_count(pid)} ```", inline=True)
+        await ctx.respond(embed=emb, view=SalesMainView(pid))
+    else: await ctx.respond("Loja vazia!", view=SalesMainView())
+
+@bot.slash_command(name="produtos", description="Lista todos os produtos da loja")
+async def produtos(ctx):
+    if not PRODUCTS: return await ctx.respond("Nenhum produto cadastrado!", ephemeral=True)
+    await ctx.defer(ephemeral=False)
+    for pid, p in PRODUCTS.items():
+        emb = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
+        emb.add_field(name="💰 Valor", value=f"```R$ {p['price']:.2f}```", inline=True)
+        emb.add_field(name="📦 Estoque", value=f"``` {get_available_stock_count(pid)} ```", inline=True)
+        await ctx.channel.send(embed=emb, view=SalesMainView(pid))
+    await ctx.interaction.edit_original_response(content="✅ Catálogo enviado!")
 
 @bot.slash_command(name="estoque_artificial", description="Adiciona itens repetidos ao estoque")
 async def estoque_artificial(ctx):
     if ctx.author.id != bot.owner_id: return await ctx.respond("Apenas o dono!", ephemeral=True)
-    if not PRODUCTS: return await ctx.respond("Crie um produto primeiro!", ephemeral=True)
-    
-    options = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-    select = Select(placeholder="Escolha o produto para o estoque artificial...", options=options)
-    
-    async def select_callback(interaction: discord.Interaction):
-        await interaction.response.send_modal(ArtificialStockModal(select.values[0]))
-    
-    select.callback = select_callback
-    view = View(); view.add_item(select)
-    await ctx.respond("Selecione o produto que deseja abastecer:", view=view, ephemeral=True)
+    opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
+    if not opts: return await ctx.respond("Crie um produto primeiro!", ephemeral=True)
+    sel = Select(placeholder="Escolha o produto...", options=opts)
+    async def sel_cb(i): await i.response.send_modal(ArtificialStockModal(sel.values[0]))
+    sel.callback = sel_cb
+    v = View(); v.add_item(sel)
+    await ctx.respond("Selecione o produto:", view=v, ephemeral=True)
 
 @bot.event
 async def on_connect(): await bot.sync_commands()
 
-# Função de Auto-Restart
 def start_bot():
     while True:
-        try:
-            print("Iniciando Bot...")
-            bot.run(DISCORD_BOT_TOKEN)
-        except Exception as e:
-            print(f"Erro: {e}. Reiniciando em 10s...")
-            time.sleep(10)
+        try: bot.run(DISCORD_BOT_TOKEN)
+        except: time.sleep(10)
 
-if DISCORD_BOT_TOKEN:
-    start_bot()
+if DISCORD_BOT_TOKEN: start_bot()
