@@ -10,6 +10,9 @@ import urllib.parse
 import time
 from datetime import datetime
 import uuid
+import qrcode
+import base64
+from io import BytesIO
 
 # --- CÓDIGO PARA MANTER ONLINE NO RENDER (ANTI-SONO ) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -30,465 +33,140 @@ threading.Thread(target=run_health_check, daemon=True).start()
 
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-PIX_KEY = "c84eccdd-893e-4d2b-9392-7a2460b0254d"
+PIX_KEY = os.getenv("PIX_KEY") 
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID") or 0)
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 
+# Arquivos de Dados
 PRODUCTS_FILE = "products.json"
-SALES_LOG_FILE = "sales_log.json"
+WALLETS_FILE = "wallets.json"
+PENDING_DEPOSITS_FILE = "pending_deposits.json"
+PENDING_SALES_FILE = "pending_sales.json"
 
-def load_products():
-    if os.path.exists(PRODUCTS_FILE):
-        with open(PRODUCTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def load_data(file, default):
+    if os.path.exists(file) and os.path.getsize(file) > 0:
+        with open(file, "r", encoding="utf-8") as f:
+            try: return json.load(f)
+            except: return default
+    return default
 
-def save_products(products):
-    with open(PRODUCTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(products, f, indent=4, ensure_ascii=False)
+def save_data(file, data):
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-def load_sales_log():
-    if os.path.exists(SALES_LOG_FILE):
-        with open(SALES_LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-def save_sales_log(log):
-    with open(SALES_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(log, f, indent=4, ensure_ascii=False)
-
-PRODUCTS = load_products()
-SALES_LOG = load_sales_log()
+PRODUCTS = load_data(PRODUCTS_FILE, {})
+WALLETS = load_data(WALLETS_FILE, {})
+DEPOSITOS_PENDENTES = load_data(PENDING_DEPOSITS_FILE, {})
+PEDIDOS_PENDENTES = load_data(PENDING_SALES_FILE, {})
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True 
 bot = discord.Bot(intents=intents)
 
-# --- Funções de Estoque ---
-def get_stock_file_path(product_id, plan_id):
-    return f"stock_{product_id}_{plan_id}.txt"
+# --- SISTEMA DE ESTOQUE ---
+def get_stock_file(pid, plid): return f"stock_{pid}_{plid}.txt"
 
-def load_stock(product_id, plan_id):
-    path = get_stock_file_path(product_id, plan_id)
+def load_stock(pid, plid):
+    path = get_stock_file(pid, plid)
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f: return [line.strip() for line in f if line.strip()]
+        with open(path, "r", encoding="utf-8") as f: return [l.strip() for l in f if l.strip()]
     return []
 
-def save_stock(product_id, plan_id, stock_list):
-    path = get_stock_file_path(product_id, plan_id)
-    with open(path, "w", encoding="utf-8") as f:
-        for item in stock_list: f.write(f"{item}\n")
+def save_stock(pid, plid, stock):
+    with open(get_stock_file(pid, plid), "w", encoding="utf-8") as f:
+        for item in stock: f.write(f"{item}\n")
 
-def get_available_stock_count(product_id, plan_id):
-    return len(load_stock(product_id, plan_id))
+def get_stock_count(pid, plid): return len(load_stock(pid, plid))
 
-def get_total_product_stock_count(product_id):
-    total_stock = 0
-    if product_id in PRODUCTS:
-        for plan_id in PRODUCTS[product_id]["plans"].keys():
-            total_stock += get_available_stock_count(product_id, plan_id)
-    return total_stock
+# --- GERAÇÃO DE PIX BRCODE ---
+def generate_pix(val, tid):
+    # Simplificado para compatibilidade
+    payload = f"00020126330014br.gov.bcb.pix01{len(PIX_KEY):02d}{PIX_KEY}52040000530398654{len(f'{val:.2f}'):02d}{val:.2f}5802BR5913BOT DE VENDAS6008BRASILIA62{len(f'05{len(tid):02d}{tid}'):02d}05{len(tid):02d}{tid}6304"
+    def crc16(d):
+        c = 0xFFFF
+        for b in d.encode("ascii"):
+            c ^= (b << 8)
+            for _ in range(8):
+                if (c & 0x8000): c = (c << 1) ^ 0x1021
+                else: c <<= 1
+        return c & 0xFFFF
+    return f"{payload}{crc16(payload):04X}"
 
-def get_one_account_from_stock(product_id, plan_id):
-    stock = load_stock(product_id, plan_id)
-    if stock:
-        account = stock.pop(0)
-        save_stock(product_id, plan_id, stock)
-        return account
-    return None
-
-# --- Gerador de PIX BRCode ---
-def crc16(data: str):
-    crc = 0xFFFF
-    for char in data:
-        crc ^= ord(char) << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = (crc << 1) ^ 0x1021
-            else:
-                crc <<= 1
-            crc &= 0xFFFF
-    return f"{crc:04X}"
-
-def generate_pix_payload(pix_key, amount, name="Vendedor", city="Brasilia"):
-    # Estrutura do PIX Estático (BRCode)
-    payload = "000201" # Payload Format Indicator
-    
-    # Merchant Account Information
-    gui = "0014BR.GOV.BR.BCB01"
-    key = f"01{len(pix_key):02d}{pix_key}"
-    merchant_account = f"26{len(gui+key):02d}{gui}{key}"
-    payload += merchant_account
-    
-    payload += "52040000" # Merchant Category Code
-    payload += "5303986" # Transaction Currency (BRL)
-    
-    val_str = f"{amount:.2f}"
-    payload += f"54{len(val_str):02d}{val_str}" # Transaction Amount
-    
-    payload += "5802BR" # Country Code
-    payload += f"59{len(name):02d}{name}" # Merchant Name
-    payload += f"60{len(city):02d}{city}" # Merchant City
-    payload += "62070503***" # Additional Data Field
-    
-    payload += "6304" # CRC16 Indicator
-    payload += crc16(payload) # Checksum final
-    return payload
-
-# --- Modals ---
-class ProductModal(Modal):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="💎 Criar Novo Produto")
-        self.add_item(TextInput(label="Título do Produto", placeholder="Ex: Conta Valorant Bronze", required=True))
-        self.add_item(TextInput(label="Descrição Detalhada", placeholder="Skins: Vandal Saqueadora...", style=discord.InputTextStyle.long, required=True))
-
-    async def callback(self, interaction: discord.Interaction):
-        name = self.children[0].value
-        description = self.children[1].value
-        product_id = str(uuid.uuid4())[:8]
-        PRODUCTS[product_id] = {"name": name, "description": description, "plans": {}}
-        save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Produto **{name}** criado! Agora adicione os planos no /painel.", ephemeral=True)
-
-class EditProductTitleModal(Modal):
-    def __init__(self, product_id, current_title, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="✏️ Editar Título")
-        self.product_id = product_id
-        self.add_item(TextInput(label="Novo Título", default_value=current_title, required=True))
-    async def callback(self, interaction: discord.Interaction):
-        new_title = self.children[0].value
-        PRODUCTS[self.product_id]["name"] = new_title
-        save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Título atualizado para \'{new_title}\'", ephemeral=True)
-
-class EditProductDescriptionModal(Modal):
-    def __init__(self, product_id, current_desc, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="✏️ Editar Descrição")
-        self.product_id = product_id
-        self.add_item(TextInput(label="Nova Descrição", default_value=current_desc, style=discord.InputTextStyle.long, required=True))
-    async def callback(self, interaction: discord.Interaction):
-        new_desc = self.children[0].value
-        PRODUCTS[self.product_id]["description"] = new_desc
-        save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Descrição atualizada.", ephemeral=True)
-
-class AddPlanModal(Modal):
-    def __init__(self, product_id, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="➕ Adicionar Novo Plano")
-        self.product_id = product_id
-        self.add_item(TextInput(label="Nome do Plano (Ex: 40 Dias)", required=True))
-        self.add_item(TextInput(label="Preço do Plano", placeholder="29.90", required=True))
-    async def callback(self, interaction: discord.Interaction):
-        plan_name = self.children[0].value
-        try: plan_price = float(self.children[1].value.replace(",", "."))
-        except: return await interaction.response.send_message("❌ Preço inválido! Use ponto para decimais (ex: 29.90).", ephemeral=True)
-        plan_id = str(uuid.uuid4())[:8]
-        PRODUCTS[self.product_id]["plans"][plan_id] = {"name": plan_name, "price": plan_price}
-        save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Plano \'{plan_name}\' adicionado!", ephemeral=True)
-
-class EditPlanNameModal(Modal):
-    def __init__(self, product_id, plan_id, current_name, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="✏️ Editar Nome do Plano")
-        self.product_id, self.plan_id = product_id, plan_id
-        self.add_item(TextInput(label="Novo Nome do Plano", default_value=current_name, required=True))
-    async def callback(self, interaction: discord.Interaction):
-        new_name = self.children[0].value
-        PRODUCTS[self.product_id]["plans"][self.plan_id]["name"] = new_name
-        save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Nome do plano atualizado para \'{new_name}\'", ephemeral=True)
-
-class EditPlanPriceModal(Modal):
-    def __init__(self, product_id, plan_id, current_price, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="✏️ Editar Preço do Plano")
-        self.product_id, self.plan_id = product_id, plan_id
-        self.add_item(TextInput(label="Novo Preço", default_value=str(current_price), required=True))
-    async def callback(self, interaction: discord.Interaction):
-        try: new_price = float(self.children[0].value.replace(",", "."))
-        except: return await interaction.response.send_message("❌ Preço inválido! Use ponto para decimais (ex: 29.90).", ephemeral=True)
-        PRODUCTS[self.product_id]["plans"][self.plan_id]["price"] = new_price
-        save_products(PRODUCTS)
-        await interaction.response.send_message(f"✅ Preço atualizado para R$ {new_price:.2f}.", ephemeral=True)
-
-class AddStockModal(Modal):
-    def __init__(self, product_id, plan_id, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title=f"📦 Abastecer Estoque")
-        self.product_id, self.plan_id = product_id, plan_id
-        self.add_item(TextInput(label="Contas (uma por linha)", placeholder="login:senha", style=discord.InputTextStyle.long, required=True))
-    async def callback(self, interaction: discord.Interaction):
-        new_accounts = [line.strip() for line in self.children[0].value.split("\n") if line.strip()]
-        save_stock(self.product_id, self.plan_id, load_stock(self.product_id, self.plan_id) + new_accounts)
-        await interaction.response.send_message(f"✅ {len(new_accounts)} contas adicionadas ao plano!", ephemeral=True)
-
-class ArtificialStockModal(Modal):
-    def __init__(self, product_id, plan_id, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title=f"➕ Estoque Artificial")
-        self.product_id, self.plan_id = product_id, plan_id
-        self.add_item(TextInput(label="Texto do Item", required=True))
-        self.add_item(TextInput(label="Quantidade", placeholder="Ex: 100", required=True))
-    async def callback(self, interaction: discord.Interaction):
-        texto = self.children[0].value
-        try: quantidade = int(self.children[1].value)
-        except: return await interaction.response.send_message("❌ Quantidade inválida!", ephemeral=True)
-        save_stock(self.product_id, self.plan_id, load_stock(self.product_id, self.plan_id) + ([texto] * quantidade))
-        await interaction.response.send_message(f"✅ {quantidade} itens artificiais adicionados ao plano!", ephemeral=True)
-
-class RestoreBackupModal(Modal):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="🔄 Restaurar Backup de Produtos")
-        self.add_item(TextInput(label="Cole o conteúdo do products.json aqui", style=discord.InputTextStyle.long, required=True))
-
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            global PRODUCTS
-            PRODUCTS = json.loads(self.children[0].value)
-            save_products(PRODUCTS)
-            await interaction.response.send_message("✅ Backup restaurado com sucesso!", ephemeral=True)
-        except json.JSONDecodeError: await interaction.response.send_message("❌ Conteúdo JSON inválido!", ephemeral=True)
-        except Exception as e: await interaction.response.send_message(f"❌ Erro ao restaurar: {e}", ephemeral=True)
-
-# --- Views ---
-class ApprovalView(View):
-    def __init__(self, buyer_id, product_id, plan_id, product_name, plan_name):
-        super().__init__(timeout=None)
-        self.buyer_id, self.product_id, self.plan_id, self.product_name, self.plan_name = buyer_id, product_id, plan_id, product_name, plan_name
-    @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.success)
-    async def approve(self, button, interaction):
-        if interaction.user.id != OWNER_ID: return await interaction.response.send_message("Apenas o dono!", ephemeral=True)
-        account = get_one_account_from_stock(self.product_id, self.plan_id)
-        if account:
-            try:
-                buyer = await bot.fetch_user(self.buyer_id)
-                await buyer.send(f"✨ **Pagamento Confirmado!**\nSua compra de **{self.product_name} ({self.plan_name})** foi entregue.\n\n🔑 **Dados:** `{account}`")
-                await interaction.response.send_message(f"✅ Entregue para <@{self.buyer_id}>!", ephemeral=False)
-                await interaction.message.edit(view=None)
-                SALES_LOG.append({"timestamp": str(datetime.now()), "buyer_id": self.buyer_id, "product_id": self.product_id, "plan_id": self.plan_id, "status": "approved"})
-                save_sales_log(SALES_LOG)
-            except: await interaction.response.send_message(f"❌ Erro ao enviar DM!", ephemeral=False)
-        else: await interaction.response.send_message("❌ Estoque vazio para este plano!", ephemeral=True)
-    @discord.ui.button(label="❌ Recusar", style=discord.ButtonStyle.danger)
-    async def deny(self, button, interaction):
-        if interaction.user.id != OWNER_ID: return await interaction.response.send_message("Apenas o dono!", ephemeral=True)
-        await interaction.response.send_message("❌ Recusado.", ephemeral=False)
-        await interaction.message.edit(view=None)
-
-class ProductBuyPlanSelectView(View):
-    def __init__(self, product_id):
-        super().__init__(timeout=None)
-        self.product_id = product_id
-        options = []
-        for plid, pl in PRODUCTS[product_id]["plans"].items():
-            stock_count = get_available_stock_count(product_id, plid)
-            if stock_count > 0:
-                options.append(discord.SelectOption(label=f"{pl['name']} - R$ {pl['price']:.2f} ({stock_count} em estoque)", value=plid))
-        
-        if options: self.add_item(Select(placeholder="Selecione o plano...", options=options, custom_id="plan_selector"))
-        else: self.add_item(Button(label="Sem planos disponíveis", style=discord.ButtonStyle.red, disabled=True))
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.data.get("custom_id") == "plan_selector":
-            plan_id = interaction.data["values"][0]
-            p = PRODUCTS[self.product_id]
-            plan = p["plans"][plan_id]
-            
-            # Gerar PIX Copia e Cola Válido
-            pix_payload = generate_pix_payload(PIX_KEY, plan["price"])
-            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={urllib.parse.quote(pix_payload )}"
-            
-            emb = discord.Embed(title="⚡ Pagamento PIX", description=f"Comprando: **{p['name']} ({plan['name']})**", color=0xf1c40f)
-            emb.add_field(name="💰 Valor", value=f"```R$ {plan['price']:.2f}```")
-            emb.add_field(name="🔑 PIX Copia e Cola", value=f"```\n{pix_payload}\n```", inline=False)
-            emb.set_image(url=qr_url)
-            emb.set_footer(text="Escaneie o QR Code ou use o código acima.")
-            
-            btn = Button(label="✅ Já paguei", style=discord.ButtonStyle.success)
-            async def paid_cb(i):
-                admin = bot.get_channel(ADMIN_CHANNEL_ID)
-                if admin:
-                    await admin.send(f"🚨 **VENDA PENDENTE** de <@{i.user.id}>: {p['name']} ({plan['name']}) - R$ {plan['price']:.2f}", view=ApprovalView(i.user.id, self.product_id, plan_id, p['name'], plan['name']))
-                    await i.response.send_message("✅ Notificado! Aguarde a aprovação do vendedor.", ephemeral=True)
-                else: await i.response.send_message("❌ Erro: Canal de administração não configurado ou inválido.", ephemeral=True)
-            btn.callback = paid_cb
-            v = View(); v.add_item(btn)
-            await interaction.response.send_message(embed=emb, view=v, ephemeral=True)
-            return False
-        return True
-
-class ProductSelectView(View):
+# --- INTERFACE DO USUÁRIO ---
+class DepositModal(Modal):
     def __init__(self):
-        super().__init__(timeout=None)
-        options = []
-        for pid, p in PRODUCTS.items():
-            total_stock = get_total_product_stock_count(pid)
-            if total_stock > 0:
-                options.append(discord.SelectOption(label=f"{p['name']} ({total_stock} em estoque)", value=pid))
+        super().__init__(title="Adicionar Saldo")
+        self.add_item(TextInput(label="Valor do Depósito (R$)", placeholder="Ex: 50.00"))
+
+    async def callback(self, interaction: discord.Interaction):
+        try: val = float(self.children[0].value.replace(",", "."))
+        except: return await interaction.response.send_message("Valor inválido!", ephemeral=True)
         
-        if options: self.add_item(Select(placeholder="Escolha um produto...", options=options, custom_id="prod_sel"))
-        else: self.add_item(Button(label="Sem produtos disponíveis", style=discord.ButtonStyle.red, disabled=True))
+        tid = str(uuid.uuid4())[:8]
+        payload = generate_pix(val, tid)
+        
+        DEPOSITOS_PENDENTES[tid] = {"user_id": interaction.user.id, "value": val, "status": "PENDENTE"}
+        save_data(PENDING_DEPOSITS_FILE, DEPOSITOS_PENDENTES)
+        
+        emb = discord.Embed(title="💳 Depósito via PIX", description=f"Valor: **R$ {val:.2f}**\n\nCopie o código abaixo e pague no seu banco. Após pagar, envie o comprovante para o suporte.", color=discord.Color.blue())
+        emb.add_field(name="PIX Copia e Cola", value=f"```\n{payload}\n```")
+        await interaction.response.send_message(embed=emb, ephemeral=True)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.data.get("custom_id") == "prod_sel":
-            pid = interaction.data["values"][0]
-            p = PRODUCTS[pid]
-            embed = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
-            total_stock = get_total_product_stock_count(pid)
-            embed.add_field(name="📦 Estoque Total", value=f"``` {total_stock} unidades ```", inline=True)
-            embed.set_footer(text="🛒 Selecione o plano abaixo para comprar")
-            await interaction.response.send_message(embed=embed, view=ProductBuyPlanSelectView(pid), ephemeral=False)
-            return False
-        return True
-
-class AdminProductEditView(View):
-    def __init__(self, product_id):
+class BuyView(View):
+    def __init__(self, pid):
         super().__init__(timeout=None)
-        self.product_id = product_id
-    @discord.ui.button(label="✏️ Título", style=discord.ButtonStyle.secondary, row=0)
-    async def edit_title(self, b, i): await i.response.send_modal(EditProductTitleModal(self.product_id, PRODUCTS[self.product_id]["name"]))
-    @discord.ui.button(label="✏️ Descrição", style=discord.ButtonStyle.secondary, row=0)
-    async def edit_desc(self, b, i): await i.response.send_modal(EditProductDescriptionModal(self.product_id, PRODUCTS[self.product_id]["description"]))
-    @discord.ui.button(label="➕/✏️ Planos", style=discord.ButtonStyle.primary, row=1)
-    async def manage_plans(self, b, i): await i.response.send_message(f"Gerenciar planos de **{PRODUCTS[self.product_id]['name']}**:", view=AdminProductEditPlanView(self.product_id), ephemeral=True)
+        self.pid = pid
+        p = PRODUCTS[pid]
+        opts = [discord.SelectOption(label=f"{pl['name']} - R$ {pl['price']:.2f} ({get_stock_count(pid, plid)} em estoque)", value=plid) for plid, pl in p["plans"].items()]
+        self.add_item(Select(placeholder="Escolha um plano...", options=opts, custom_id="sel_plan"))
 
-class AdminProductEditPlanView(View):
-    def __init__(self, product_id):
-        super().__init__(timeout=None)
-        self.product_id = product_id
-        opts = [discord.SelectOption(label=f"{pl['name']} (R$ {pl['price']:.2f})", value=plid) for plid, pl in PRODUCTS[product_id]["plans"].items()]
-        if opts:
-            sel = Select(placeholder="Selecione um plano para editar...", options=opts)
-            async def sel_cb(i):
-                plid = sel.values[0]
-                pl = PRODUCTS[self.product_id]["plans"][plid]
-                v = View()
-                b1 = Button(label="✏️ Nome", style=discord.ButtonStyle.secondary)
-                b1.callback = lambda i2: i2.response.send_modal(EditPlanNameModal(self.product_id, plid, pl["name"]))
-                b2 = Button(label="✏️ Preço", style=discord.ButtonStyle.secondary)
-                b2.callback = lambda i2: i2.response.send_modal(EditPlanPriceModal(self.product_id, plid, pl["price"]))
-                v.add_item(b1); v.add_item(b2)
-                await i.response.send_message(f"Editando plano \'{pl['name']}\':", view=v, ephemeral=True)
-            sel.callback = sel_cb
-            self.add_item(sel)
-    @discord.ui.button(label="➕ Adicionar Plano", style=discord.ButtonStyle.success, row=1)
-    async def add_pl(self, b, i): await i.response.send_modal(AddPlanModal(self.product_id))
-    @discord.ui.button(label="🗑️ Remover Plano", style=discord.ButtonStyle.danger, row=1)
-    async def rem_pl(self, b, i):
-        opts = [discord.SelectOption(label=pl["name"], value=plid) for plid, pl in PRODUCTS[self.product_id]["plans"].items()]
-        if not opts: return await i.response.send_message("Vazio!", ephemeral=True)
-        sel = Select(options=opts)
-        async def sel_cb(i2):
-            plid = sel.values[0]
-            del PRODUCTS[self.product_id]["plans"][plid]
-            save_products(PRODUCTS)
-            await i2.response.send_message("✅ Removido!", ephemeral=True)
-        sel.callback = sel_cb
-        v = View(); v.add_item(sel); await i.response.send_message("Remover qual?", view=v, ephemeral=True)
+    @discord.ui.button(label="Comprar com Saldo", style=discord.ButtonStyle.green)
+    async def buy_balance(self, button, interaction):
+        plid = self.children[0].values[0] if self.children[0].values else None
+        if not plid: return await interaction.response.send_message("Selecione um plano!", ephemeral=True)
+        
+        uid = str(interaction.user.id)
+        balance = WALLETS.get(uid, 0)
+        price = PRODUCTS[self.pid]["plans"][plid]["price"]
+        
+        if balance < price: return await interaction.response.send_message(f"Saldo insuficiente! Você tem R$ {balance:.2f}", ephemeral=True)
+        
+        stock = load_stock(self.pid, plid)
+        if not stock: return await interaction.response.send_message("Sem estoque!", ephemeral=True)
+        
+        item = stock.pop(0)
+        save_stock(self.pid, plid, stock)
+        WALLETS[uid] = balance - price
+        save_data(WALLETS_FILE, WALLETS)
+        
+        await interaction.user.send(f"✅ Compra realizada! Seu item: `{item}`")
+        await interaction.response.send_message("✅ Item enviado na sua DM!", ephemeral=True)
 
-class AdminProductStockPlanSelectView(View):
-    def __init__(self, product_id, modal_class):
-        super().__init__(timeout=None)
-        opts = [discord.SelectOption(label=f"{pl['name']} ({get_available_stock_count(product_id, plid)} em estoque)", value=plid) for plid, pl in PRODUCTS[product_id]["plans"].items()]
-        if opts:
-            sel = Select(placeholder="Escolha o plano...", options=opts)
-            sel.callback = lambda i: i.response.send_modal(modal_class(product_id, sel.values[0]))
-            self.add_item(sel)
+# --- COMANDOS ---
+@bot.slash_command(name="carteira", description="Ver seu saldo e depositar")
+async def carteira(ctx):
+    uid = str(ctx.author.id)
+    bal = WALLETS.get(uid, 0)
+    emb = discord.Embed(title="💰 Minha Carteira", description=f"Seu saldo atual: **R$ {bal:.2f}**", color=discord.Color.gold())
+    view = View(); view.add_item(Button(label="Adicionar Saldo", style=discord.ButtonStyle.primary, custom_id="dep"))
+    await ctx.respond(embed=emb, view=view)
 
-class AdminPanelMainView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
+@bot.slash_command(name="painel", description="Painel Admin")
+async def painel(ctx):
+    if ctx.author.id != OWNER_ID: return await ctx.respond("Acesso negado!", ephemeral=True)
+    await ctx.respond("🛠️ Painel Admin", ephemeral=True)
 
-    @discord.ui.button(label="➕ Criar Produto", style=discord.ButtonStyle.success, row=0)
-    async def create(self, b, i): await i.response.send_modal(ProductModal())
-
-    @discord.ui.button(label="✏️ Editar Produto", style=discord.ButtonStyle.secondary, row=0)
-    async def edit(self, b, i):
-        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        if not opts: return await i.response.send_message("Vazio!", ephemeral=True)
-        sel = Select(options=opts)
-        sel.callback = lambda i2: i2.response.send_message(f"Editando **{PRODUCTS[sel.values[0]]['name']}**:", view=AdminProductEditView(sel.values[0]), ephemeral=True)
-        v = View(); v.add_item(sel); await i.response.send_message("Editar qual?", view=v, ephemeral=True)
-
-    @discord.ui.button(label="📦 Abastecer Estoque", style=discord.ButtonStyle.primary, row=1)
-    async def stock(self, b, i):
-        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        if not opts: return await i.response.send_message("Vazio!", ephemeral=True)
-        sel = Select(placeholder="Selecione o produto...", options=opts)
-        sel.callback = lambda i2: i2.response.send_message("Escolha o plano:", view=AdminProductStockPlanSelectView(sel.values[0], AddStockModal), ephemeral=True)
-        v = View(); v.add_item(sel); await i.response.send_message("Abastecer qual?", view=v, ephemeral=True)
-
-    @discord.ui.button(label="➕ Estoque Artificial", style=discord.ButtonStyle.blurple, row=1)
-    async def art(self, b, i):
-        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        if not opts: return await i.response.send_message("Vazio!", ephemeral=True)
-        sel = Select(placeholder="Selecione o produto...", options=opts)
-        sel.callback = lambda i2: i2.response.send_message("Escolha o plano:", view=AdminProductStockPlanSelectView(sel.values[0], ArtificialStockModal), ephemeral=True)
-        v = View(); v.add_item(sel); await i.response.send_message("Qual produto?", view=v, ephemeral=True)
-
-    @discord.ui.button(label="🗑️ Excluir Produto", style=discord.ButtonStyle.danger, row=2)
-    async def del_p(self, b, i):
-        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        if not opts: return await i.response.send_message("Nada para excluir!", ephemeral=True)
-        sel = Select(options=opts)
-        async def sel_cb(i2):
-            pid_to_delete = sel.values[0]
-            product_name = PRODUCTS[pid_to_delete]["name"]
-            del PRODUCTS[pid_to_delete]
-            save_products(PRODUCTS)
-            await i2.response.send_message(f"✅ Produto **{product_name}** excluído!", ephemeral=True)
-        sel.callback = sel_cb
-        v = View(); v.add_item(sel); await i.response.send_message("Excluir qual?", view=v, ephemeral=True)
-
-    @discord.ui.button(label="💾 Backup", style=discord.ButtonStyle.blurple, row=2)
-    async def backup_btn(self, b, i):
-        await i.response.defer(ephemeral=True)
-        with open(PRODUCTS_FILE, "rb") as f:
-            await i.followup.send("📦 Backup de produtos:", file=discord.File(f, "products.json"), ephemeral=True)
-        await i.followup.send("✅ Backup enviado!", ephemeral=True)
-
-    @discord.ui.button(label="🔄 Restaurar Backup", style=discord.ButtonStyle.danger, row=3)
-    async def restore_backup_btn(self, button, interaction):
-        await interaction.response.send_modal(RestoreBackupModal())
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type == discord.InteractionType.component:
+        cid = interaction.data.get("custom_id")
+        if cid == "dep": await interaction.response.send_modal(DepositModal())
 
 @bot.event
 async def on_ready():
     print(f"Bot Online: {bot.user}")
+    await bot.sync_commands()
 
-# --- Comandos de Barra ---
-@bot.slash_command(name="definirproduto", description="Envia a vitrine de um produto específico")
-async def definirproduto(ctx, produto: discord.Option(str, "Escolha o produto", autocomplete=lambda ctx: [p["name"] for p in PRODUCTS.values()])):
-    if not PRODUCTS: return await ctx.respond("Nenhum produto cadastrado!", ephemeral=True)
-    product_id = next((pid for pid, p in PRODUCTS.items() if p["name"] == produto), None)
-    if not product_id: return await ctx.respond("Produto não encontrado!", ephemeral=True)
-    p = PRODUCTS[product_id]
-    embed = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
-    total_stock = get_total_product_stock_count(product_id)
-    embed.add_field(name="📦 Estoque Total", value=f"``` {total_stock} unidades ```", inline=True)
-    embed.set_footer(text="🛒 Selecione o plano abaixo para comprar")
-    await ctx.respond(embed=embed, view=ProductBuyPlanSelectView(product_id))
-
-@bot.slash_command(name="produtos", description="Mostra todos os produtos da loja")
-async def produtos(ctx):
-    if not PRODUCTS: return await ctx.respond("Nenhum produto cadastrado!", ephemeral=True)
-    await ctx.respond("Selecione um produto para ver os detalhes:", view=ProductSelectView(), ephemeral=False)
-
-@bot.slash_command(name="painel", description="Abre o painel administrativo")
-async def painel(ctx):
-    if ctx.author.id != OWNER_ID: return await ctx.respond(f"❌ Acesso Negado.", ephemeral=True)
-    await ctx.respond("🛠️ **Painel Administrativo da Loja**", view=AdminPanelMainView(), ephemeral=True)
-
-@bot.slash_command(name="backup", description="Faz backup dos dados")
-async def backup(ctx):
-    if ctx.author.id != OWNER_ID: return await ctx.respond("❌ Apenas o dono!", ephemeral=True)
-    await ctx.defer(ephemeral=True)
-    with open(PRODUCTS_FILE, "rb") as f:
-        await ctx.followup.send("📦 Backup:", file=discord.File(f, "products.json"), ephemeral=True)
-
-@bot.event
-async def on_connect(): await bot.sync_commands()
-
-def start_bot():
-    while True:
-        try: bot.run(DISCORD_BOT_TOKEN)
-        except: time.sleep(10)
-
-if DISCORD_BOT_TOKEN: start_bot()
+bot.run(DISCORD_BOT_TOKEN)
