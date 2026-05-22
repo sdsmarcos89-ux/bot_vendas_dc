@@ -6,13 +6,22 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 import asyncio
+import urllib.parse
+import time
+from datetime import datetime
+import uuid
+import qrcode
+import base64
+from io import BytesIO
 
-# --- CÓDIGO PARA MANTER ONLINE NO RENDER ---
+# --- CÓDIGO PARA MANTER ONLINE NO RENDER (ANTI-SONO) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot de Vendas Online")
+        self.wfile.write(b"<html><body><h1>Bot Profissional com Carteira Online!</h1></body></html>")
+    def log_message(self, format, *args): return
 
 def run_health_check():
     port = int(os.environ.get("PORT", 10000))
@@ -20,393 +29,246 @@ def run_health_check():
     server.serve_forever()
 
 threading.Thread(target=run_health_check, daemon=True).start()
-# -------------------------------------------
+# -------------------------------------------------------
 
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-PIX_KEY = os.getenv("PIX_KEY") # Sua chave PIX
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID")) # ID do canal para notificações de admin
+PIX_KEY = os.getenv("PIX_KEY") 
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 
-# Arquivo para armazenar produtos (nome, preço, descrição) e seus estoques (arquivos .txt)
 PRODUCTS_FILE = "products.json"
+SALES_LOG_FILE = "sales_log.json"
+WALLETS_FILE = "wallets.json" 
+PENDING_DEPOSITS_FILE = "pending_deposits.json"
 
-def load_products():
-    if os.path.exists(PRODUCTS_FILE):
-        with open(PRODUCTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def load_json(filename):
+    if os.path.exists(filename) and os.path.getsize(filename) > 0:
+        with open(filename, "r", encoding="utf-8") as f:
+            try: return json.load(f)
+            except: return {} if "log" not in filename else []
+    return {} if "log" not in filename else []
 
-def save_products(products):
-    with open(PRODUCTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(products, f, indent=4, ensure_ascii=False)
+def save_json(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-# Carrega os produtos existentes
-PRODUCTS = load_products()
+PRODUCTS = load_json(PRODUCTS_FILE)
+WALLETS = load_json(WALLETS_FILE)
+DEPOSITOS_PENDENTES = load_json(PENDING_DEPOSITS_FILE)
 
-# Configuração do bot do Discord
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True # Para interações com membros, se necessário
+intents.members = True 
 bot = discord.Bot(intents=intents)
 
-# --- Funções de Estoque --- #
+# --- Funções de Carteira ---
+def get_wallet(user_id):
+    user_id = str(user_id)
+    if user_id not in WALLETS:
+        WALLETS[user_id] = {"balance": 0.0, "total_spent": 0.0, "total_deposited": 0.0}
+        save_json(WALLETS_FILE, WALLETS)
+    return WALLETS[user_id]
 
-def get_stock_file_path(product_id):
-    return f"stock_{product_id}.txt"
+def update_balance(user_id, amount):
+    user_id = str(user_id)
+    wallet = get_wallet(user_id)
+    wallet["balance"] += amount
+    if amount > 0: wallet["total_deposited"] += amount
+    else: wallet["total_spent"] += abs(amount)
+    save_json(WALLETS_FILE, WALLETS)
+    return wallet["balance"]
 
-def load_stock(product_id):
-    path = get_stock_file_path(product_id)
+# --- Funções de Estoque ---
+def get_stock_file_path(product_id, plan_id):
+    return f"stock_{product_id}_{plan_id}.txt"
+
+def load_stock(product_id, plan_id):
+    path = get_stock_file_path(product_id, plan_id)
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip()]
+        with open(path, "r", encoding="utf-8") as f: return [line.strip() for line in f if line.strip()]
     return []
 
-def save_stock(product_id, stock_list):
-    path = get_stock_file_path(product_id)
+def save_stock(product_id, plan_id, stock_list):
+    path = get_stock_file_path(product_id, plan_id)
     with open(path, "w", encoding="utf-8") as f:
-        for item in stock_list:
-            f.write(f"{item}\n")
+        for item in stock_list: f.write(f"{item}\n")
 
-def get_available_stock_count(product_id):
-    return len(load_stock(product_id))
+def get_available_stock_count(product_id, plan_id):
+    return len(load_stock(product_id, plan_id))
 
-def get_one_account_from_stock(product_id):
-    stock = load_stock(product_id)
-    if stock:
-        account = stock.pop(0) # Pega a primeira conta
-        save_stock(product_id, stock) # Salva o estoque atualizado
-        return account
-    return None
+def get_total_product_stock_count(product_id):
+    total_stock = 0
+    if product_id in PRODUCTS:
+        for plan_id in PRODUCTS[product_id]["plans"].keys():
+            total_stock += get_available_stock_count(product_id, plan_id)
+    return total_stock
 
-# --- Classes de Modais e Views --- #
+# --- Geração de PIX ---
+def generate_pix_payload(value, txid):
+    # Payload simplificado para exibição (Copia e Cola)
+    return f"00020126330014br.gov.bcb.pix0111{PIX_KEY}52040000530398654{len(f'{value:.2f}'):02d}{value:.2f}5802BR5913BOT DE VENDAS6008BRASILIA62070503{txid[:3]}6304"
 
-# Modal para adicionar/editar produtos
-class ProductModal(Modal):
-    def __init__(self, product_id=None, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="Adicionar/Editar Produto")
-        self.product_id = product_id
-
-        self.add_item(TextInput(label="Nome do Produto", placeholder="Ex: Conta de Fortnite", required=True))
-        self.add_item(TextInput(label="Descrição", placeholder="Conta com skins raras...", style=discord.InputTextStyle.long, required=True))
-        self.add_item(TextInput(label="Preço (R$)", placeholder="Ex: 49.99", required=True))
-
-        if product_id and product_id in PRODUCTS:
-            product = PRODUCTS[product_id]
-            self.children[0].default_value = product["name"]
-            self.children[1].default_value = product["description"]
-            self.children[2].default_value = str(product["price"])
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        name = self.children[0].value
-        description = self.children[1].value
-        try:
-            price = float(self.children[2].value)
-        except ValueError:
-            await interaction.followup.send_message("❌ Preço inválido. Use números.", ephemeral=True)
-            return
-
-        if self.product_id:
-            product_id = self.product_id
-        else:
-            product_id = name.lower().replace(" ", "-").replace("ç", "c").replace("ã", "a").replace("õ", "o").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
-            i = 1
-            original_product_id = product_id
-            while product_id in PRODUCTS:
-                product_id = f"{original_product_id}-{i}"
-                i += 1
-
-        PRODUCTS[product_id] = {
-            "name": name,
-            "description": description,
-            "price": price
-        }
-        save_products(PRODUCTS)
-        await interaction.followup.send_message(f"✅ Produto **{name}** salvo com sucesso! Estoque inicial é 0. Use o botão \'Gerenciar Estoque\' para adicionar contas.", ephemeral=True)
-
-# Modal para remover produtos
-class RemoveProductModal(Modal):
+# --- Modals ---
+class DepositModal(Modal):
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="Remover Produto")
-        self.add_item(TextInput(label="ID do Produto", placeholder="Ex: conta-de-fortnite", required=True))
+        super().__init__(*args, **kwargs, title="💰 Adicionar Saldo")
+        self.add_item(TextInput(label="Valor do Depósito (R$)", placeholder="Ex: 50.00", required=True))
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        product_id = self.children[0].value.lower()
-        if product_id in PRODUCTS:
-            del PRODUCTS[product_id]
-            stock_path = get_stock_file_path(product_id)
-            if os.path.exists(stock_path):
-                os.remove(stock_path)
-            save_products(PRODUCTS)
-            await interaction.followup.send_message(f"✅ Produto com ID **{product_id}** e seu estoque removidos com sucesso!", ephemeral=True)
-        else:
-            await interaction.followup.send_message(f"❌ Produto com ID **{product_id}** não encontrado.", ephemeral=True)
+        try:
+            value = float(self.children[0].value.replace(",", "."))
+            if value < 1.0: return await interaction.followup.send_message("❌ Valor mínimo para depósito é R$ 1,00.", ephemeral=True)
+        except:
+            return await interaction.followup.send_message("❌ Valor inválido!", ephemeral=True)
 
-# Modal para adicionar estoque (contas)
-class AddStockModal(Modal):
-    def __init__(self, product_id, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title=f"Adicionar Contas para {PRODUCTS[product_id]["name"]}")
-        self.product_id = product_id
-        self.add_item(TextInput(label="Contas (uma por linha)", placeholder="login:senha\nlogin2:senha2", style=discord.InputTextStyle.long, required=True))
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        new_accounts = [line.strip() for line in self.children[0].value.split("\n") if line.strip()]
-        current_stock = load_stock(self.product_id)
-        updated_stock = current_stock + new_accounts
-        save_stock(self.product_id, updated_stock)
-        await interaction.followup.send_message(f"✅ {len(new_accounts)} contas adicionadas para **{PRODUCTS[self.product_id]["name"]}**! Estoque total: {len(updated_stock)}.", ephemeral=True)
-
-# View para gerenciar estoque
-class StockManagementView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="➕ Adicionar Contas", style=discord.ButtonStyle.success, custom_id="add_accounts")
-    async def add_accounts_callback(self, button: Button, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if not PRODUCTS:
-            await interaction.followup.send_message("Nenhum produto cadastrado para adicionar estoque.", ephemeral=True)
-            return
+        txid = str(uuid.uuid4())[:8]
+        pix_payload = generate_pix_payload(value, txid)
         
-        options = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        if not options:
-            await interaction.followup.send_message("Nenhum produto disponível para adicionar estoque.", ephemeral=True)
-            return
+        DEPOSITOS_PENDENTES[txid] = {"user_id": interaction.user.id, "value": value, "timestamp": datetime.now().isoformat()}
+        save_json(PENDING_DEPOSITS_FILE, DEPOSITOS_PENDENTES)
 
-        select = Select(placeholder="Escolha o produto para adicionar contas...", options=options, custom_id="select_product_for_stock")
-        async def select_callback(interaction: discord.Interaction):
-            selected_product_id = select.values[0]
-            await interaction.response.send_modal(AddStockModal(selected_product_id))
-        select.callback = select_callback
+        embed = discord.Embed(title="💳 Depósito Gerado", description=f"Você solicitou um depósito de **R$ {value:.2f}**.\n\n**PIX Copia e Cola:**\n```\n{pix_payload}\n```\nApós pagar, envie o comprovante para um administrador ou aguarde a aprovação manual.", color=discord.Color.blue())
         
-        view = View(timeout=60)
-        view.add_item(select)
-        await interaction.followup.send_message("Selecione o produto:", view=view, ephemeral=True)
+        # Notificar Admin
+        admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+        if admin_channel:
+            admin_embed = discord.Embed(title="🔔 Novo Pedido de Depósito", color=discord.Color.orange())
+            admin_embed.add_field(name="Usuário", value=f"<@{interaction.user.id}>", inline=True)
+            admin_embed.add_field(name="Valor", value=f"R$ {value:.2f}", inline=True)
+            admin_embed.add_field(name="TXID", value=f"`{txid}`", inline=True)
+            
+            view = View(timeout=None)
+            view.add_item(Button(label="✅ Aprovar", style=discord.ButtonStyle.success, custom_id=f"dep_app_{txid}"))
+            view.add_item(Button(label="❌ Recusar", style=discord.ButtonStyle.danger, custom_id=f"dep_rej_{txid}"))
+            await admin_channel.send(embed=admin_embed, view=view)
 
-    @discord.ui.button(label="📊 Ver Estoque", style=discord.ButtonStyle.primary, custom_id="view_stock")
-    async def view_stock_callback(self, button: Button, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if not PRODUCTS:
-            await interaction.followup.send_message("Nenhum produto cadastrado.", ephemeral=True)
-            return
-        
-        embed = discord.Embed(title="📊 Estoque Atual", color=discord.Color.orange())
-        for pid, product in PRODUCTS.items():
-            stock_count = get_available_stock_count(pid)
-            embed.add_field(name=product["name"], value=f"Disponível: {stock_count}", inline=True)
         await interaction.followup.send_message(embed=embed, ephemeral=True)
 
-# View para aprovação de vendas (Admin)
-class ApprovalView(View):
-    def __init__(self, buyer_id, product_id, product_name, price, original_message_id):
-        super().__init__(timeout=300) # 5 minutos para aprovar/recusar
-        self.buyer_id = buyer_id
-        self.product_id = product_id
-        self.product_name = product_name
-        self.price = price
-        self.original_message_id = original_message_id
-
-    @discord.ui.button(label="✅ Aprovar Venda", style=discord.ButtonStyle.success, custom_id="approve_sale")
-    async def approve_sale_callback(self, button: Button, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        # Apenas admins podem aprovar (verificação básica)
-        if interaction.user.id != bot.owner_id and interaction.user.id not in [bot.owner_id]: # Adicione IDs de admins aqui
-            await interaction.followup.send_message("❌ Você não tem permissão para aprovar vendas.", ephemeral=True)
-            return
-
-        account = get_one_account_from_stock(self.product_id)
-        if account:
-            try:
-                buyer = await bot.fetch_user(self.buyer_id)
-                await buyer.send(f"✅ Sua compra de **{self.product_name}** foi aprovada!\nSua conta: ||{account}||")
-                await buyer.send("Por favor, teste sua conta e nos avise se tiver qualquer problema.")
-                await interaction.followup.send_message(f"✅ Venda de **{self.product_name}** para <@{self.buyer_id}> aprovada e conta entregue!", ephemeral=False)
-                # Edita a mensagem original para indicar que foi aprovada
-                original_message = await interaction.channel.fetch_message(self.original_message_id)
-                await original_message.edit(content=f"✅ Venda Aprovada para <@{self.buyer_id}>: **{self.product_name}** (R${self.price:.2f})", view=None)
-            except discord.Forbidden:
-                await interaction.followup.send_message(f"❌ Não foi possível enviar DM para <@{self.buyer_id}>. A conta **{account}** foi removida do estoque. Por favor, entre em contato com o comprador manualmente.", ephemeral=False)
-                original_message = await interaction.channel.fetch_message(self.original_message_id)
-                await original_message.edit(content=f"❌ Venda Aprovada (DM Bloqueada) para <@{self.buyer_id}>: **{self.product_name}** (R${self.price:.2f})", view=None)
-            except Exception as e:
-                await interaction.followup.send_message(f"❌ Erro ao entregar a conta: {e}. A conta **{account}** foi removida do estoque. Por favor, entre em contato com o comprador manualmente.", ephemeral=False)
-                original_message = await interaction.channel.fetch_message(self.original_message_id)
-                await original_message.edit(content=f"❌ Venda Aprovada (Erro na Entrega) para <@{self.buyer_id}>: **{self.product_name}** (R${self.price:.2f})", view=None)
-        else:
-            await interaction.followup.send_message(f"❌ Não há contas disponíveis no estoque para **{self.product_name}**. Venda não aprovada.", ephemeral=False)
-            original_message = await interaction.channel.fetch_message(self.original_message_id)
-            await original_message.edit(content=f"❌ Venda Recusada (Estoque Vazio) para <@{self.buyer_id}>: **{self.product_name}** (R${self.price:.2f})", view=None)
-        self.stop()
-
-    @discord.ui.button(label="❌ Recusar Venda", style=discord.ButtonStyle.danger, custom_id="deny_sale")
-    async def deny_sale_callback(self, button: Button, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        # Apenas admins podem recusar
-        if interaction.user.id != bot.owner_id and interaction.user.id not in [bot.owner_id]: # Adicione IDs de admins aqui
-            await interaction.followup.send_message("❌ Você não tem permissão para recusar vendas.", ephemeral=True)
-            return
-
-        buyer = await bot.fetch_user(self.buyer_id)
-        await buyer.send(f"❌ Sua compra de **{self.product_name}** foi recusada. Por favor, entre em contato com o suporte.")
-        await interaction.followup.send_message(f"❌ Venda de **{self.product_name}** para <@{self.buyer_id}> recusada.", ephemeral=False)
-        original_message = await interaction.channel.fetch_message(self.original_message_id)
-        await original_message.edit(content=f"❌ Venda Recusada para <@{self.buyer_id}>: **{self.product_name}** (R${self.price:.2f})", view=None)
-        self.stop()
-
-# View para o menu principal de vendas
-class SalesMainView(View):
-    def __init__(self):
+# --- Views ---
+class WalletMainView(View):
+    def __init__(self, user_id):
         super().__init__(timeout=None)
+        self.user_id = user_id
 
-    @discord.ui.button(label="🛒 Ver Produtos", style=discord.ButtonStyle.primary, custom_id="view_products")
-    async def view_products_callback(self, button: Button, interaction: discord.Interaction):
+    @discord.ui.button(label="💰 Adicionar Saldo", style=discord.ButtonStyle.success, custom_id="wallet_deposit")
+    async def deposit_callback(self, button, interaction):
+        await interaction.response.send_modal(DepositModal())
+
+    @discord.ui.button(label="🔄 Atualizar", style=discord.ButtonStyle.secondary, custom_id="wallet_refresh")
+    async def refresh_callback(self, button, interaction):
         await interaction.response.defer(ephemeral=True)
-        if not PRODUCTS:
-            await interaction.followup.send_message("Nenhum produto cadastrado ainda.", ephemeral=True)
-            return
+        wallet = get_wallet(interaction.user.id)
+        embed = discord.Embed(title="👤 Seu Perfil", color=discord.Color.blue())
+        embed.add_field(name="💵 Saldo Atual", value=f"``` R$ {wallet['balance']:.2f} ```", inline=False)
+        embed.add_field(name="📊 Total Gasto", value=f"R$ {wallet['total_spent']:.2f}", inline=True)
+        embed.add_field(name="📥 Total Depositado", value=f"R$ {wallet['total_deposited']:.2f}", inline=True)
+        await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=self)
 
-        embed = discord.Embed(title="🛍️ Nossas Contas de Jogos", color=discord.Color.blue())
-        for pid, product in PRODUCTS.items():
-            stock_count = get_available_stock_count(pid)
-            embed.add_field(name=f"{product["name"]} - R${product["price"]:.2f}", 
-                            value=f"{product["description"]}\nEstoque: {stock_count}", 
-                            inline=False)
-        await interaction.followup.send_message(embed=embed, ephemeral=True)
+class ProductBuyView(View):
+    def __init__(self, product_id, plan_id):
+        super().__init__(timeout=None)
+        self.product_id = product_id
+        self.plan_id = plan_id
 
-    @discord.ui.button(label="💰 Comprar Agora", style=discord.ButtonStyle.green, custom_id="buy_product")
-    async def buy_product_callback(self, button: Button, interaction: discord.Interaction):
+    @discord.ui.button(label="🛒 Comprar com Saldo", style=discord.ButtonStyle.green, custom_id="buy_with_wallet")
+    async def buy_callback(self, button, interaction):
         await interaction.response.defer(ephemeral=True)
-        if not PRODUCTS or all(get_available_stock_count(pid) == 0 for pid in PRODUCTS):
-            await interaction.followup.send_message("Nenhum produto disponível para compra no momento.", ephemeral=True)
-            return
+        wallet = get_wallet(interaction.user.id)
+        plan = PRODUCTS[self.product_id]["plans"][self.plan_id]
         
-        options = []
-        for pid, product in PRODUCTS.items():
-            if get_available_stock_count(pid) > 0:
-                options.append(discord.SelectOption(label=product["name"], description=f"R${product["price"]:.2f} - Estoque: {get_available_stock_count(pid)}", value=pid))
+        if wallet["balance"] < plan["price"]:
+            return await interaction.followup.send_message(f"❌ Saldo insuficiente! Você precisa de mais R$ {plan['price'] - wallet['balance']:.2f}.", ephemeral=True)
         
-        if not options:
-            await interaction.followup.send_message("Nenhum produto disponível para compra no momento.", ephemeral=True)
-            return
-
-        select = Select(placeholder="Escolha a conta que deseja comprar...", options=options, custom_id="select_product_to_buy")
-        async def select_callback(interaction: discord.Interaction):
-            await interaction.response.defer(ephemeral=True)
-            selected_product_id = select.values[0]
-            product = PRODUCTS[selected_product_id]
-            
-            if not PIX_KEY:
-                await interaction.followup.send_message("❌ Chave PIX não configurada pelo administrador.", ephemeral=True)
-                return
-
-            embed = discord.Embed(title=f"💰 Compra de {product["name"]}", color=discord.Color.gold())
-            embed.add_field(name="Valor", value=f"R${product["price"]:.2f}", inline=False)
-            embed.add_field(name="Chave PIX", value=f"```\n{PIX_KEY}\n```", inline=False)
-            embed.set_footer(text="Faça o pagamento e clique em 'Já Paguei' para notificar o vendedor.")
-            
-            confirm_view = View(timeout=300) # 5 minutos para confirmar pagamento
-            confirm_view.add_item(Button(label="✅ Já Paguei", style=discord.ButtonStyle.success, custom_id=f"paid_{interaction.user.id}_{selected_product_id}"))
-
-            await interaction.followup.send_message(embed=embed, view=confirm_view, ephemeral=True)
-
-        select.callback = select_callback
+        stock = load_stock(self.product_id, self.plan_id)
+        if not stock:
+            return await interaction.followup.send_message("❌ Estoque vazio para este plano no momento.", ephemeral=True)
         
-        view = View(timeout=60)
-        view.add_item(select)
-        await interaction.followup.send_message("Selecione a conta que deseja comprar:", view=view, ephemeral=True)
+        item = stock.pop(0)
+        save_stock(self.product_id, self.plan_id, stock)
+        update_balance(interaction.user.id, -plan["price"])
+        
+        # Entrega
+        try:
+            embed = discord.Embed(title="🎉 Compra Realizada!", description=f"Produto: **{PRODUCTS[self.product_id]['name']}**\nPlano: **{plan['name']}**\n\n**Seu Item:**\n```\n{item}\n```", color=discord.Color.green())
+            await interaction.user.send(embed=embed)
+            await interaction.followup.send_message("✅ Produto entregue na sua DM!", ephemeral=True)
+        except:
+            await interaction.followup.send_message(f"⚠️ Sua DM está fechada! Aqui está seu item: `{item}`", ephemeral=True)
 
-    @discord.ui.button(label="⚙️ Gerenciar Produtos (Admin)", style=discord.ButtonStyle.secondary, custom_id="admin_products", row=2)
-    async def admin_products_callback(self, button: Button, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        # Verificação de permissão de admin (exemplo simples)
-        if interaction.user.id != bot.owner_id and interaction.user.id not in [bot.owner_id]: # Adicione IDs de admins aqui
-            await interaction.followup.send_message("❌ Você não tem permissão para acessar o painel de administração.", ephemeral=True)
-            return
+# --- Comandos ---
+@bot.slash_command(name="perfil", description="Veja seu saldo e informações da conta")
+async def perfil(ctx):
+    wallet = get_wallet(ctx.author.id)
+    embed = discord.Embed(title="👤 Seu Perfil", color=discord.Color.blue())
+    embed.add_field(name="💵 Saldo Atual", value=f"``` R$ {wallet['balance']:.2f} ```", inline=False)
+    embed.add_field(name="📊 Total Gasto", value=f"R$ {wallet['total_spent']:.2f}", inline=True)
+    embed.add_field(name="📥 Total Depositado", value=f"R$ {wallet['total_deposited']:.2f}", inline=True)
+    await ctx.respond(embed=embed, view=WalletMainView(ctx.author.id))
 
-        admin_view = View(timeout=60)
-        admin_view.add_item(Button(label="➕ Adicionar Produto", style=discord.ButtonStyle.success, custom_id="add_prod_admin"))
-        admin_view.add_item(Button(label="➖ Remover Produto", style=discord.ButtonStyle.danger, custom_id="remove_prod_admin"))
-        admin_view.add_item(Button(label="📊 Gerenciar Estoque", style=discord.ButtonStyle.primary, custom_id="manage_stock_admin"))
+@bot.slash_command(name="depositar", description="Adicione saldo à sua carteira")
+async def depositar(ctx):
+    await ctx.send_modal(DepositModal())
 
-        async def add_prod_admin_callback(interaction: discord.Interaction):
-            await interaction.response.send_modal(ProductModal())
-        admin_view.children[0].callback = add_prod_admin_callback
+@bot.slash_command(name="saldo", description="Verifica seu saldo rapidamente")
+async def saldo(ctx):
+    wallet = get_wallet(ctx.author.id)
+    await ctx.respond(f"💰 Seu saldo atual é: **R$ {wallet['balance']:.2f}**", ephemeral=True)
 
-        async def remove_prod_admin_callback(interaction: discord.Interaction):
-            await interaction.response.send_modal(RemoveProductModal())
-        admin_view.children[1].callback = remove_prod_admin_callback
-
-        async def manage_stock_admin_callback(interaction: discord.Interaction):
-            await interaction.response.defer(ephemeral=True)
-            await interaction.followup.send_message("Gerenciamento de Estoque:", view=StockManagementView(), ephemeral=True)
-        admin_view.children[2].callback = manage_stock_admin_callback
-
-        await interaction.followup.send_message("Painel de Administração de Produtos:", view=admin_view, ephemeral=True)
-
-# --- Eventos do Bot --- #
-
-@bot.event
-async def on_ready():
-    print(f"Bot de Vendas online como {bot.user}")
-    # Adiciona as views persistentes ao iniciar o bot
-    bot.add_view(SalesMainView())
-    bot.add_view(StockManagementView())
-
-@bot.slash_command(name="loja", description="Abre o menu principal da loja de vendas.")
-async def sales_menu(ctx):
-    await ctx.respond("Bem-vindo à nossa loja de contas! Escolha uma opção abaixo:", view=SalesMainView())
-
+# --- Evento de Interação Global (Para Aprovação de Depósitos) ---
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
-    # Processa comandos de barra primeiro
     if interaction.type == discord.InteractionType.application_command:
         await bot.process_application_commands(interaction)
         return
 
-    # Processa interações de componentes (botões/menus) que NÃO estão em Views
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data.get("custom_id", "")
         
-        if custom_id.startswith("paid_"):
+        if custom_id.startswith("dep_app_"):
             await interaction.response.defer(ephemeral=True)
-            parts = custom_id.split("_")
-            buyer_id = int(parts[1])
-            product_id = parts[2]
-            
-            if not ADMIN_CHANNEL_ID:
-                await interaction.followup.send_message("❌ Canal de administração não configurado. O vendedor não pode ser notificado.", ephemeral=True)
-                return
+            txid = custom_id.replace("dep_app_", "")
+            if txid in DEPOSITOS_PENDENTES:
+                dep = DEPOSITOS_PENDENTES.pop(txid)
+                save_json(PENDING_DEPOSITS_FILE, DEPOSITOS_PENDENTES)
+                
+                new_balance = update_balance(dep["user_id"], dep["value"])
+                
+                # Notificar Usuário
+                try:
+                    user = await bot.fetch_user(dep["user_id"])
+                    await user.send(f"✅ Seu depósito de **R$ {dep['value']:.2f}** foi aprovado! Novo saldo: **R$ {new_balance:.2f}**")
+                except: pass
+                
+                await interaction.followup.send_message(f"✅ Depósito de R$ {dep['value']:.2f} aprovado para <@{dep['user_id']}>.", ephemeral=True)
+                await interaction.message.edit(content=f"✅ Depósito Aprovado por <@{interaction.user.id}>", view=None)
+            else:
+                await interaction.followup.send_message("❌ Depósito não encontrado ou já processado.", ephemeral=True)
 
-            admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
-            if not admin_channel:
-                await interaction.followup.send_message("❌ Canal de administração não encontrado. Verifique o ID configurado.", ephemeral=True)
-                return
-            
-            product = PRODUCTS.get(product_id)
-            if not product:
-                await interaction.followup.send_message("❌ Produto não encontrado no catálogo.", ephemeral=True)
-                return
+        elif custom_id.startswith("dep_rej_"):
+            await interaction.response.defer(ephemeral=True)
+            txid = custom_id.replace("dep_rej_", "")
+            if txid in DEPOSITOS_PENDENTES:
+                dep = DEPOSITOS_PENDENTES.pop(txid)
+                save_json(PENDING_DEPOSITS_FILE, DEPOSITOS_PENDENTES)
+                
+                try:
+                    user = await bot.fetch_user(dep["user_id"])
+                    await user.send(f"❌ Seu depósito de **R$ {dep['value']:.2f}** foi recusado pelo administrador.")
+                except: pass
+                
+                await interaction.followup.send_message(f"❌ Depósito de R$ {dep['value']:.2f} recusado.", ephemeral=True)
+                await interaction.message.edit(content=f"❌ Depósito Recusado por <@{interaction.user.id}>", view=None)
+            else:
+                await interaction.followup.send_message("❌ Depósito não encontrado ou já processado.", ephemeral=True)
 
-            # Envia notificação para o canal de admin
-            embed = discord.Embed(title="🔔 Nova Venda Pendente!", color=discord.Color.orange())
-            embed.add_field(name="Comprador", value=f"<@{buyer_id}> (ID: {buyer_id})", inline=False)
-            embed.add_field(name="Produto", value=f"{product["name"]} (ID: {product_id})", inline=False)
-            embed.add_field(name="Valor", value=f"R${product["price"]:.2f}", inline=False)
-            embed.set_footer(text="Verifique o pagamento e aprove ou recuse a venda.")
-            
-            # Criamos a view de aprovação. Importante: ela precisa de um ID de mensagem para ser editada depois.
-            # Como a mensagem de admin ainda não foi enviada, passamos 0 e atualizamos depois.
-            approval_view = ApprovalView(buyer_id, product_id, product["name"], product["price"], 0)
-            
-            admin_message = await admin_channel.send(embed=embed, view=approval_view)
-            approval_view.original_message_id = admin_message.id 
+# Registro de Views Persistentes
+@bot.event
+async def on_ready():
+    print(f"Bot com Carteira online como {bot.user}")
+    # Aqui você adicionaria views persistentes se necessário
 
-            await interaction.followup.send_message("✅ Sua notificação de pagamento foi enviada ao vendedor. Aguarde a aprovação!", ephemeral=True)
-
-# Executa o bot com o token
 if DISCORD_BOT_TOKEN:
     bot.run(DISCORD_BOT_TOKEN)
-else:
-    print("Erro: O token do bot do Discord não foi encontrado. Por favor, defina a variável de ambiente \'DISCORD_BOT_TOKEN\'.")
