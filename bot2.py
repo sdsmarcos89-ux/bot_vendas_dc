@@ -9,7 +9,6 @@ def install_dependencies():
         try:
             __import__(lib.replace("-", "_"))
         except ImportError:
-            print(f"Instalando {lib}...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
 
 install_dependencies()
@@ -35,7 +34,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot Online")
+        self.wfile.write(b"Bot Hibrido Online")
     def log_message(self, format, *args): return
 
 def run_health_check():
@@ -53,24 +52,28 @@ ADMIN_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 
 # Arquivos de Dados
-DB = {"products": "products.json", "wallets": "wallets.json", "deposits": "pending_deposits.json"}
+DB_FILES = {"products": "products.json", "wallets": "wallets.json", "deposits": "pending_deposits.json", "sales": "pending_sales.json"}
 
 def load_db(key):
-    file = DB[key]
+    file = DB_FILES[key]
     if os.path.exists(file) and os.path.getsize(file) > 0:
-        with open(file, "r", encoding="utf-8") as f: return json.load(f)
+        with open(file, "r", encoding="utf-8") as f:
+            try: return json.load(f)
+            except: return {}
     return {}
 
 def save_db(key, data):
-    with open(DB[key], "w", encoding="utf-8") as f: json.dump(data, f, indent=4, ensure_ascii=False)
+    with open(DB_FILES[key], "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 PRODUCTS = load_db("products")
 WALLETS = load_db("wallets")
 DEPOSITS = load_db("deposits")
+SALES = load_db("sales")
 
 bot = discord.Bot(intents=discord.Intents.all())
 
-# --- Lógica de Negócio ---
+# --- Funções Auxiliares ---
 def get_wallet(uid):
     uid = str(uid)
     if uid not in WALLETS: WALLETS[uid] = {"balance": 0.0}; save_db("wallets", WALLETS)
@@ -103,13 +106,13 @@ class DepositModal(Modal):
         DEPOSITS[txid] = {"uid": i.user.id, "val": val}
         save_db("deposits", DEPOSITS)
         pix = f"00020126330014br.gov.bcb.pix0111{PIX_KEY}52040000530398654{len(f'{val:.2f}'):02d}{val:.2f}5802BR5913BOT6008BRASILIA62070503{txid[:3]}6304"
-        emb = discord.Embed(title="💳 PIX Gerado", description=f"Valor: **R$ {val:.2f}**\n\n**Copia e Cola:**\n```\n{pix}\n```", color=0x00ff00)
+        emb = discord.Embed(title="💳 Depósito PIX", description=f"Valor: **R$ {val:.2f}**\n\n**Copia e Cola:**\n```\n{pix}\n```", color=0x00ff00)
         admin = bot.get_channel(ADMIN_ID)
         if admin:
             v = View(timeout=None)
-            v.add_item(Button(label="Aprovar", style=discord.ButtonStyle.success, custom_id=f"app_{txid}"))
-            v.add_item(Button(label="Recusar", style=discord.ButtonStyle.danger, custom_id=f"rej_{txid}"))
-            await admin.send(f"🔔 Depósito de R$ {val:.2f} por <@{i.user.id}>", view=v)
+            v.add_item(Button(label="Aprovar", style=discord.ButtonStyle.success, custom_id=f"dep_app_{txid}"))
+            v.add_item(Button(label="Recusar", style=discord.ButtonStyle.danger, custom_id=f"dep_rej_{txid}"))
+            await admin.send(f"📥 **Novo Depósito**: R$ {val:.2f} por <@{i.user.id}>", view=v)
         await i.followup.send_message(embed=emb, ephemeral=True)
 
 class ProductModal(Modal):
@@ -122,7 +125,7 @@ class ProductModal(Modal):
         await i.response.defer(ephemeral=True)
         pid = self.pid or str(uuid.uuid4())[:8]
         PRODUCTS[pid] = {"name": self.children[0].value, "description": self.children[1].value, "plans": PRODUCTS[pid]["plans"] if self.pid else {}}
-        save_db("products", PRODUCTS); await i.followup.send_message("✅ Salvo!", ephemeral=True)
+        save_db("products", PRODUCTS); await i.followup.send_message("✅ Produto Salvo!", ephemeral=True)
 
 class PlanModal(Modal):
     def __init__(self, pid): super().__init__(title="➕ Novo Plano"); self.pid = pid
@@ -134,13 +137,13 @@ class PlanModal(Modal):
         save_db("products", PRODUCTS); await i.followup.send_message("✅ Plano Adicionado!", ephemeral=True)
 
 # --- Comandos ---
-@bot.slash_command(name="perfil")
+@bot.slash_command(name="perfil", description="Ver seu saldo")
 async def perfil(ctx):
     w = get_wallet(ctx.author.id)
-    v = View(); v.add_item(Button(label="💰 Depositar", style=discord.ButtonStyle.success, custom_id="btn_dep"))
+    v = View(); v.add_item(Button(label="💰 Adicionar Saldo", style=discord.ButtonStyle.success, custom_id="btn_dep"))
     await ctx.respond(f"👤 **Seu Perfil**\n💵 Saldo: `R$ {w['balance']:.2f}`", view=v)
 
-@bot.slash_command(name="loja")
+@bot.slash_command(name="loja", description="Ver produtos")
 async def loja(ctx):
     if not PRODUCTS: return await ctx.respond("Loja vazia!", ephemeral=True)
     v = View(); sel = Select(placeholder="Escolha um produto...")
@@ -148,15 +151,15 @@ async def loja(ctx):
     async def sel_cb(i):
         await i.response.defer(ephemeral=True)
         pid = sel.values[0]; p = PRODUCTS[pid]; plans = p["plans"]
-        emb = discord.Embed(title=p["name"], description=p["description"], color=0x0000ff)
+        emb = discord.Embed(title=p["name"], description=p["description"], color=0x3498db)
         v2 = View()
         for plid, pl in plans.items():
             stock = len(get_stock(pid, plid))
-            v2.add_item(Button(label=f"{pl['name']} - R$ {pl['price']:.2f} ({stock})", style=discord.ButtonStyle.primary, custom_id=f"buy_{pid}_{plid}"))
+            v2.add_item(Button(label=f"{pl['name']} - R$ {pl['price']:.2f} ({stock})", style=discord.ButtonStyle.primary, custom_id=f"view_plan_{pid}_{plid}"))
         await i.followup.send_message(embed=emb, view=v2, ephemeral=True)
     sel.callback = sel_cb; v.add_item(sel); await ctx.respond("🛍️ **Nossa Loja**", view=v)
 
-@bot.slash_command(name="painel")
+@bot.slash_command(name="painel", description="Admin")
 async def painel(ctx):
     if ctx.author.id != OWNER_ID: return await ctx.respond("Acesso negado!", ephemeral=True)
     v = View()
@@ -171,23 +174,65 @@ async def on_interaction(i: discord.Interaction):
     if i.type == discord.InteractionType.application_command: await bot.process_application_commands(i)
     if i.type == discord.InteractionType.component:
         cid = i.data.get("custom_id", "")
-        if cid == "btn_dep": await i.response.send_modal(DepositModal())
-        elif cid.startswith("app_"):
-            await i.response.defer(ephemeral=True); txid = cid[4:]
+        
+        # Fluxo de Compra: Ver Opções
+        if cid.startswith("view_plan_"):
+            await i.response.defer(ephemeral=True)
+            _, pid, plid = cid.split("_"); pl = PRODUCTS[pid]["plans"][plid]
+            emb = discord.Embed(title="💳 Escolha a forma de pagamento", description=f"Produto: **{PRODUCTS[pid]['name']}**\nPlano: **{pl['name']}**\nPreço: **R$ {pl['price']:.2f}**", color=0xf1c40f)
+            v = View()
+            v.add_item(Button(label="✅ Pagar Agora (PIX)", style=discord.ButtonStyle.success, custom_id=f"pay_now_{pid}_{plid}"))
+            v.add_item(Button(label="💰 Comprar com Saldo", style=discord.ButtonStyle.primary, custom_id=f"buy_wallet_{pid}_{plid}"))
+            await i.followup.send_message(embed=emb, view=v, ephemeral=True)
+
+        # Opção 1: Pagar Agora (Direto)
+        elif cid.startswith("pay_now_"):
+            await i.response.defer(ephemeral=True); _, _, pid, plid = cid.split("_"); pl = PRODUCTS[pid]["plans"][plid]
+            txid = str(uuid.uuid4())[:8]; SALES[txid] = {"uid": i.user.id, "pid": pid, "plid": plid}
+            save_db("sales", SALES)
+            pix = f"00020126330014br.gov.bcb.pix0111{PIX_KEY}52040000530398654{len(f'{pl['price']:.2f}'):02d}{pl['price']:.2f}5802BR5913BOT6008BRASILIA62070503{txid[:3]}6304"
+            emb = discord.Embed(title="⚡ Pagamento Direto", description=f"Valor: **R$ {pl['price']:.2f}**\n\n**Copia e Cola:**\n```\n{pix}\n```\nApós pagar, aguarde a aprovação do vendedor.", color=0x2ecc71)
+            admin = bot.get_channel(ADMIN_ID)
+            if admin:
+                v = View(timeout=None)
+                v.add_item(Button(label="Aprovar Venda", style=discord.ButtonStyle.success, custom_id=f"sale_app_{txid}"))
+                v.add_item(Button(label="Recusar Venda", style=discord.ButtonStyle.danger, custom_id=f"sale_rej_{txid}"))
+                await admin.send(f"🛒 **Nova Venda Direta**: {PRODUCTS[pid]['name']} ({pl['name']}) por <@{i.user.id}>", view=v)
+            await i.followup.send_message(embed=emb, ephemeral=True)
+
+        # Opção 2: Comprar com Saldo
+        elif cid.startswith("buy_wallet_"):
+            await i.response.defer(ephemeral=True); _, _, pid, plid = cid.split("_"); w = get_wallet(i.user.id); pl = PRODUCTS[pid]["plans"][plid]
+            if w["balance"] < pl["price"]: return await i.followup.send_message("❌ Saldo insuficiente na carteira! Use 'Pagar Agora' ou adicione saldo.", ephemeral=True)
+            s = get_stock(pid, plid)
+            if not s: return await i.followup.send_message("❌ Sem estoque disponível!", ephemeral=True)
+            item = s.pop(0); save_stock(pid, plid, s); add_balance(i.user.id, -pl["price"])
+            try: await i.user.send(f"🎉 Compra entregue: `{item}`"); await i.followup.send_message("✅ Entregue na sua DM!", ephemeral=True)
+            except: await i.followup.send_message(f"⚠️ DM fechada! Seu item: `{item}`", ephemeral=True)
+
+        # Admin: Aprovação de Depósito
+        elif cid.startswith("dep_app_"):
+            await i.response.defer(ephemeral=True); txid = cid[8:]
             if txid in DEPOSITS:
                 d = DEPOSITS.pop(txid); save_db("deposits", DEPOSITS); add_balance(d["uid"], d["val"])
                 try: u = await bot.fetch_user(d["uid"]); await u.send(f"✅ Depósito de R$ {d['val']:.2f} aprovado!")
                 except: pass
-                await i.followup.send_message("✅ Aprovado!", ephemeral=True); await i.message.edit(view=None)
-        elif cid.startswith("buy_"):
-            await i.response.defer(ephemeral=True); _, pid, plid = cid.split("_")
-            w = get_wallet(i.user.id); pl = PRODUCTS[pid]["plans"][plid]
-            if w["balance"] < pl["price"]: return await i.followup.send_message("❌ Saldo insuficiente!", ephemeral=True)
-            s = get_stock(pid, plid)
-            if not s: return await i.followup.send_message("❌ Sem estoque!", ephemeral=True)
-            item = s.pop(0); save_stock(pid, plid, s); add_balance(i.user.id, -pl["price"])
-            try: await i.user.send(f"🎉 Compra: `{item}`"); await i.followup.send_message("✅ Entregue na DM!", ephemeral=True)
-            except: await i.followup.send_message(f"⚠️ DM fechada! Item: `{item}`", ephemeral=True)
+                await i.followup.send_message("✅ Depósito Aprovado!", ephemeral=True); await i.message.edit(view=None)
+
+        # Admin: Aprovação de Venda Direta
+        elif cid.startswith("sale_app_"):
+            await i.response.defer(ephemeral=True); txid = cid[9:]
+            if txid in SALES:
+                s_info = SALES.pop(txid); save_db("sales", SALES)
+                s = get_stock(s_info["pid"], s_info["plid"])
+                if not s: return await i.followup.send_message("❌ Estoque acabou!", ephemeral=True)
+                item = s.pop(0); save_stock(s_info["pid"], s_info["plid"], s)
+                try: u = await bot.fetch_user(s_info["uid"]); await u.send(f"✅ Venda aprovada! Item: `{item}`")
+                except: pass
+                await i.followup.send_message("✅ Venda Aprovada!", ephemeral=True); await i.message.edit(view=None)
+
+        # Outros Botões Admin
+        elif cid == "btn_dep": await i.response.send_modal(DepositModal())
         elif cid == "adm_p": await i.response.send_modal(ProductModal())
         elif cid == "adm_pl":
             v = View(); sel = Select(placeholder="Produto...")
@@ -214,6 +259,6 @@ async def on_interaction(i: discord.Interaction):
             sel.callback = cb; v.add_item(sel); await i.response.send_message("Produto:", view=v, ephemeral=True)
 
 @bot.event
-async def on_ready(): print(f"Bot Online: {bot.user}")
+async def on_ready(): print(f"Bot Hibrido Online: {bot.user}")
 
 if TOKEN: bot.run(TOKEN)
