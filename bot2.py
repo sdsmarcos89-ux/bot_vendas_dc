@@ -360,10 +360,17 @@ async def sales_menu(ctx):
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
+    # Processa comandos de barra primeiro
+    if interaction.type == discord.InteractionType.application_command:
+        await bot.process_application_commands(interaction)
+        return
+
+    # Processa interações de componentes (botões/menus) que NÃO estão em Views
     if interaction.type == discord.InteractionType.component:
-        await interaction.response.defer(ephemeral=True)
-        custom_id = interaction.data["custom_id"]
+        custom_id = interaction.data.get("custom_id", "")
+        
         if custom_id.startswith("paid_"):
+            await interaction.response.defer(ephemeral=True)
             parts = custom_id.split("_")
             buyer_id = int(parts[1])
             product_id = parts[2]
@@ -389,16 +396,14 @@ async def on_interaction(interaction: discord.Interaction):
             embed.add_field(name="Valor", value=f"R${product["price"]:.2f}", inline=False)
             embed.set_footer(text="Verifique o pagamento e aprove ou recuse a venda.")
             
-            approval_view = ApprovalView(buyer_id, product_id, product["name"], product["price"], interaction.message.id)
+            # Criamos a view de aprovação. Importante: ela precisa de um ID de mensagem para ser editada depois.
+            # Como a mensagem de admin ainda não foi enviada, passamos 0 e atualizamos depois.
+            approval_view = ApprovalView(buyer_id, product_id, product["name"], product["price"], 0)
             
-            # Envia a mensagem de notificação e guarda o ID para edição futura
             admin_message = await admin_channel.send(embed=embed, view=approval_view)
-            approval_view.original_message_id = admin_message.id # Atualiza o ID da mensagem para a view
+            approval_view.original_message_id = admin_message.id 
 
             await interaction.followup.send_message("✅ Sua notificação de pagamento foi enviada ao vendedor. Aguarde a aprovação!", ephemeral=True)
-    
-    else:
-        await bot.process_application_commands(interaction)
 
 # Executa o bot com o token
 if DISCORD_BOT_TOKEN:
