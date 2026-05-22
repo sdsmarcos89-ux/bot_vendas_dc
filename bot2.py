@@ -84,6 +84,13 @@ def save_stock(product_id, plan_id, stock_list):
 def get_available_stock_count(product_id, plan_id):
     return len(load_stock(product_id, plan_id))
 
+def get_total_product_stock_count(product_id):
+    total_stock = 0
+    if product_id in PRODUCTS:
+        for plan_id in PRODUCTS[product_id]["plans"].keys():
+            total_stock += get_available_stock_count(product_id, plan_id)
+    return total_stock
+
 def get_one_account_from_stock(product_id, plan_id):
     stock = load_stock(product_id, plan_id)
     if stock:
@@ -170,7 +177,7 @@ class EditPlanPriceModal(Modal):
 
 class AddStockModal(Modal):
     def __init__(self, product_id, plan_id, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="📦 Abastecer Estoque")
+        super().__init__(*args, **kwargs, title=f"📦 Abastecer Estoque - {PRODUCTS[product_id]['plans'][plan_id]['name']}")
         self.product_id, self.plan_id = product_id, plan_id
         self.add_item(TextInput(label="Contas (uma por linha)", placeholder="login:senha", style=discord.InputTextStyle.long, required=True))
     async def callback(self, interaction: discord.Interaction):
@@ -180,7 +187,7 @@ class AddStockModal(Modal):
 
 class ArtificialStockModal(Modal):
     def __init__(self, product_id, plan_id, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, title="➕ Estoque Artificial")
+        super().__init__(*args, **kwargs, title=f"➕ Estoque Artificial - {PRODUCTS[product_id]['plans'][plan_id]['name']}")
         self.product_id, self.plan_id = product_id, plan_id
         self.add_item(TextInput(label="Texto do Item", required=True))
         self.add_item(TextInput(label="Quantidade", placeholder="Ex: 100", required=True))
@@ -206,7 +213,7 @@ class ApprovalView(View):
                 await buyer.send(f"✨ **Pagamento Confirmado!**\nSua compra de **{self.product_name} ({self.plan_name})** foi entregue.\n\n🔑 **Dados:** `{account}`")
                 await interaction.response.send_message(f"✅ Entregue para <@{self.buyer_id}>!", ephemeral=False)
                 await interaction.message.edit(view=None)
-                SALES_LOG.append({"timestamp": str(datetime.now()), "buyer_id": self.buyer_id, "product_id": self.product_id, "status": "approved"})
+                SALES_LOG.append({"timestamp": str(datetime.now()), "buyer_id": self.buyer_id, "product_id": self.product_id, "plan_id": self.plan_id, "status": "approved"})
                 save_sales_log(SALES_LOG)
             except: await interaction.response.send_message(f"❌ Erro ao enviar DM!", ephemeral=False)
         else: await interaction.response.send_message("❌ Estoque vazio!", ephemeral=True)
@@ -222,7 +229,7 @@ class ProductBuyPlanSelectView(View):
         self.product_id = product_id
         options = [discord.SelectOption(label=f"{p['name']} - R$ {p['price']:.2f}", value=pid) for pid, p in PRODUCTS[product_id]["plans"].items() if get_available_stock_count(product_id, pid) > 0]
         if options: self.add_item(Select(placeholder="Selecione o plano...", options=options, custom_id="plan_selector"))
-        else: self.add_item(Button(label="Sem estoque", style=discord.ButtonStyle.red, disabled=True))
+        else: self.add_item(Button(label="Sem planos disponíveis", style=discord.ButtonStyle.red, disabled=True))
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.data.get("custom_id") == "plan_selector":
             plan_id = interaction.data["values"][0]
@@ -255,94 +262,228 @@ class ProductSelectView(View):
         if interaction.data.get("custom_id") == "prod_sel":
             pid = interaction.data["values"][0]
             p = PRODUCTS[pid]
-            emb = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
-            for plid, pl in p["plans"].items():
-                emb.add_field(name=f"**{pl['name']}**", value=f"```R$ {pl['price']:.2f} | Estoque: {get_available_stock_count(pid, plid)}```", inline=True)
-            await interaction.response.send_message(embed=emb, view=ProductBuyPlanSelectView(pid), ephemeral=False)
+            embed = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
+            total_stock = get_total_product_stock_count(pid)
+            embed.add_field(name="📦 Estoque Total", value=f"``` {total_stock} unidades ```", inline=True)
+            embed.set_footer(text="🛒 Selecione o plano abaixo para comprar")
+            await interaction.response.send_message(embed=embed, view=ProductBuyPlanSelectView(pid), ephemeral=False)
+            return False
+        return True
+
+class AdminProductEditPlanView(View):
+    def __init__(self, product_id):
+        super().__init__(timeout=None)
+        self.product_id = product_id
+        self.add_item(Button(label="➕ Adicionar Plano", style=discord.ButtonStyle.success, custom_id="add_plan_btn", row=0))
+        self.add_item(Button(label="🗑️ Remover Plano", style=discord.ButtonStyle.danger, custom_id="remove_plan_btn", row=0))
+        options = []
+        for plan_id, plan_data in PRODUCTS[product_id]["plans"].items():
+            options.append(discord.SelectOption(label=f"{plan_data['name']} (R$ {plan_data['price']:.2f})", value=plan_id))
+        if options:
+            self.add_item(Select(placeholder="Selecione um plano para editar...", options=options, custom_id="edit_plan_selector", row=1))
+        else:
+            self.add_item(Button(label="Nenhum plano para editar", style=discord.ButtonStyle.secondary, disabled=True, row=1))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != OWNER_ID: 
+            await interaction.response.send_message("❌ Apenas o dono pode editar produtos.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="➕ Adicionar Plano", style=discord.ButtonStyle.success, custom_id="add_plan_btn", row=0)
+    async def add_plan_btn_cb(self, button, interaction):
+        await interaction.response.send_modal(AddPlanModal(self.product_id))
+
+    @discord.ui.button(label="🗑️ Remover Plano", style=discord.ButtonStyle.danger, custom_id="remove_plan_btn", row=0)
+    async def remove_plan_btn_cb(self, button, interaction):
+        options = []
+        for plan_id, plan_data in PRODUCTS[self.product_id]["plans"].items():
+            options.append(discord.SelectOption(label=plan_data['name'], value=plan_id))
+        if not options: return await interaction.response.send_message("Nenhum plano para remover!", ephemeral=True)
+        
+        select = Select(placeholder="Selecione o plano para remover...", options=options)
+        async def sel_cb(i):
+            plan_to_remove_id = select.values[0]
+            plan_name = PRODUCTS[self.product_id]["plans"][plan_to_remove_id]["name"]
+            del PRODUCTS[self.product_id]["plans"][plan_to_remove_id]
+            save_products(PRODUCTS)
+            stock_path = get_stock_file_path(self.product_id, plan_to_remove_id)
+            if os.path.exists(stock_path): os.remove(stock_path)
+            await i.response.send_message(f"✅ Plano \'{plan_name}\' removido!", ephemeral=True)
+        select.callback = sel_cb
+        view = View(); view.add_item(select)
+        await interaction.response.send_message("Selecione o plano para remover:", view=view, ephemeral=True)
+
+    @discord.ui.select(placeholder="Selecione um plano para editar...", custom_id="edit_plan_selector", row=1)
+    async def edit_plan_selector_cb(self, select, interaction):
+        selected_plan_id = select.values[0]
+        plan_data = PRODUCTS[self.product_id]["plans"][selected_plan_id]
+        
+        view = View()
+        view.add_item(Button(label="✏️ Nome", style=discord.ButtonStyle.secondary))
+        view.children[0].callback = lambda i: i.response.send_modal(EditPlanNameModal(self.product_id, selected_plan_id, plan_data["name"]))
+        view.add_item(Button(label="✏️ Preço", style=discord.ButtonStyle.secondary))
+        view.children[1].callback = lambda i: i.response.send_modal(EditPlanPriceModal(self.product_id, selected_plan_id, plan_data["price"]))
+
+        await interaction.response.send_message(f"Editando plano \'{plan_data['name']}\' do produto **{PRODUCTS[self.product_id]['name']}**:", view=view, ephemeral=True)
+
+class AdminProductStockPlanSelectView(View):
+    def __init__(self, product_id, modal_class):
+        super().__init__(timeout=None)
+        self.product_id = product_id
+        self.modal_class = modal_class
+        options = []
+        for plan_id, plan_data in PRODUCTS[product_id]["plans"].items():
+            options.append(discord.SelectOption(label=f"{plan_data['name']} ({get_available_stock_count(product_id, plan_id)} em estoque)", value=plan_id))
+        
+        if options:
+            self.add_item(Select(placeholder="Selecione o plano...", options=options, custom_id="stock_plan_selector"))
+        else:
+            self.add_item(Button(label="Nenhum plano para abastecer", style=discord.ButtonStyle.red, disabled=True))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.data.get("custom_id") == "stock_plan_selector":
+            selected_plan_id = interaction.data["values"][0]
+            await interaction.response.send_modal(self.modal_class(self.product_id, selected_plan_id))
             return False
         return True
 
 class AdminPanelMainView(View):
     def __init__(self):
         super().__init__(timeout=None)
-    @discord.ui.button(label="➕ Novo Produto", style=discord.ButtonStyle.success, row=0)
-    async def create(self, b, i): await i.response.send_modal(ProductModal())
-    @discord.ui.button(label="✏️ Editar Planos", style=discord.ButtonStyle.secondary, row=0)
-    async def edit(self, b, i):
+
+    @discord.ui.button(label="➕ Criar Produto", style=discord.ButtonStyle.success, row=0)
+    async def create_btn(self, b, i): await i.response.send_modal(ProductModal())
+
+    @discord.ui.button(label="✏️ Editar Produto", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_product_btn(self, button, interaction):
         opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        if not opts: return await i.response.send_message("Sem produtos!", ephemeral=True)
-        sel = Select(placeholder="Escolha o produto...", options=opts)
-        async def sel_cb(i2):
-            pid = sel.values[0]
-            v = View()
-            v.add_item(Button(label="➕ Novo Plano", style=discord.ButtonStyle.success))
-            v.children[0].callback = lambda i3: i3.response.send_modal(AddPlanModal(pid))
-            # Opções de edição de planos existentes
-            pl_opts = [discord.SelectOption(label=pl["name"], value=plid) for plid, pl in PRODUCTS[pid]["plans"].items()]
-            if pl_opts:
-                pl_sel = Select(placeholder="Editar plano...", options=pl_opts)
-                async def pl_cb(i4):
-                    plid = pl_sel.values[0]
-                    v2 = View()
-                    v2.add_item(Button(label="Nome", style=discord.ButtonStyle.secondary))
-                    v2.children[0].callback = lambda i5: i5.response.send_modal(EditPlanNameModal(pid, plid, PRODUCTS[pid]["plans"][plid]["name"]))
-                    v2.add_item(Button(label="Preço", style=discord.ButtonStyle.secondary))
-                    v2.children[1].callback = lambda i5: i5.response.send_modal(EditPlanPriceModal(pid, plid, PRODUCTS[pid]["plans"][plid]["price"]))
-                    await i4.response.send_message("O que editar?", view=v2, ephemeral=True)
-                pl_sel.callback = pl_cb
-                v.add_item(pl_sel)
-            await i2.response.send_message("Gerenciar Planos:", view=v, ephemeral=True)
-        sel.callback = sel_cb
-        v = View(); v.add_item(sel); await i.response.send_message("Selecione o produto:", view=v, ephemeral=True)
-    @discord.ui.button(label="📦 Estoque", style=discord.ButtonStyle.primary, row=1)
-    async def stock(self, b, i):
+        if not opts: return await interaction.response.send_message("Nenhum produto para editar!", ephemeral=True)
+        select = Select(placeholder="Escolha o produto para editar...", options=opts)
+        async def sel_cb(i):
+            selected_pid = select.values[0]
+            await i.response.send_message(f"Editando **{PRODUCTS[selected_pid]['name']}**:", view=AdminProductEditPlanView(selected_pid), ephemeral=True)
+        select.callback = sel_cb
+        view = View(); view.add_item(select)
+        await interaction.response.send_message("Selecione o produto para gerenciar planos:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="📦 Abastecer Estoque", style=discord.ButtonStyle.primary, row=1)
+    async def stock_btn(self, b, i):
         opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
+        if not opts: return await i.response.send_message("Crie um produto!", ephemeral=True)
+        select = Select(placeholder="Selecione o produto...", options=opts)
+        async def sel_cb(i):
+            selected_pid = select.values[0]
+            await i.response.send_message(f"Abastecer estoque de **{PRODUCTS[selected_pid]['name']}**:", view=AdminProductStockPlanSelectView(selected_pid, AddStockModal), ephemeral=True)
+        select.callback = sel_cb
+        v = View(); v.add_item(select)
+        await interaction.response.send_message("Selecione o produto para abastecer:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="➕ Estoque Artificial", style=discord.ButtonStyle.blurple, row=1)
+    async def art_btn(self, b, i):
+        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
+        if not opts: return await interaction.response.send_message("Crie um produto!", ephemeral=True)
+        select = Select(placeholder="Selecione o produto...", options=opts)
+        async def sel_cb(i):
+            selected_pid = select.values[0]
+            await i.response.send_message(f"Estoque artificial para **{PRODUCTS[selected_pid]['name']}**:", view=AdminProductStockPlanSelectView(selected_pid, ArtificialStockModal), ephemeral=True)
+        select.callback = sel_cb
+        v = View(); v.add_item(select)
+        await interaction.response.send_message("Selecione o produto para estoque artificial:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="🗑️ Excluir Produto", style=discord.ButtonStyle.danger, row=2)
+    async def del_btn(self, b, i):
+        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
+        if not opts: return await i.response.send_message("Nada para excluir!", ephemeral=True)
         sel = Select(options=opts)
-        async def sel_cb(i2):
+        async def del_cb(i2):
             pid = sel.values[0]
-            pl_opts = [discord.SelectOption(label=pl["name"], value=plid) for plid, pl in PRODUCTS[pid]["plans"].items()]
-            pl_sel = Select(options=pl_opts)
-            pl_sel.callback = lambda i3: i3.response.send_modal(AddStockModal(pid, pl_sel.values[0]))
-            v = View(); v.add_item(pl_sel); await i2.response.send_message("Escolha o plano:", view=v, ephemeral=True)
-        sel.callback = sel_cb
-        v = View(); v.add_item(sel); await i.response.send_message("Escolha o produto:", view=v, ephemeral=True)
-    @discord.ui.button(label="➕ Est. Artificial", style=discord.ButtonStyle.blurple, row=1)
-    async def art(self, b, i):
-        opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
-        sel = Select(options=opts)
-        async def sel_cb(i2):
-            pid = sel.values[0]
-            pl_opts = [discord.SelectOption(label=pl["name"], value=plid) for plid, pl in PRODUCTS[pid]["plans"].items()]
-            pl_sel = Select(options=pl_opts)
-            pl_sel.callback = lambda i3: i3.response.send_modal(ArtificialStockModal(pid, pl_sel.values[0]))
-            v = View(); v.add_item(pl_sel); await i2.response.send_message("Escolha o plano:", view=v, ephemeral=True)
-        sel.callback = sel_cb
-        v = View(); v.add_item(sel); await i.response.send_message("Escolha o produto:", view=v, ephemeral=True)
-    @discord.ui.button(label="💾 Backup", style=discord.ButtonStyle.secondary, row=2)
-    async def backup(self, b, i):
+            del PRODUCTS[pid]
+            save_products(PRODUCTS)
+            for plan_id in PRODUCTS.get(pid, {}).get("plans", {}).keys():
+                stock_path = get_stock_file_path(pid, plan_id)
+                if os.path.exists(stock_path): os.remove(stock_path)
+            await i2.response.send_message(f"✅ Produto **{pid}** e seus estoques excluídos!", ephemeral=True)
+        sel.callback = del_cb
+        v = View(); v.add_item(sel); await i.response.send_message("Excluir qual?", view=v, ephemeral=True)
+
+    @discord.ui.button(label="📊 Logs de Vendas", style=discord.ButtonStyle.secondary, row=2)
+    async def log_btn(self, b, i):
+        if not SALES_LOG: return await i.response.send_message("Sem logs.", ephemeral=True)
+        emb = discord.Embed(title="📊 Últimas Vendas", color=0x2f3136)
+        for e in reversed(SALES_LOG[-5:]):
+            plan_name = "N/A"
+            if e.get("product_id") in PRODUCTS and e.get("plan_id") in PRODUCTS[e["product_id"]]["plans"]:
+                plan_name = PRODUCTS[e["product_id"]]["plans"][e["plan_id"]]["name"]
+            emb.add_field(name=f"{e['status'].upper()} - {e['product_id']} ({plan_name})", value=f"Comprador: <@{e['buyer_id']}>\nData: {e['timestamp'][:16]}", inline=False)
+        await i.response.send_message(embed=emb, ephemeral=True)
+
+    @discord.ui.button(label="💾 Backup", style=discord.ButtonStyle.blurple, row=2)
+    async def backup_btn(self, b, i):
         await i.response.defer(ephemeral=True)
-        with open(PRODUCTS_FILE, "rb") as f: await i.followup.send(file=discord.File(f, "products.json"), ephemeral=True)
-        await i.followup.send("Backup enviado!", ephemeral=True)
+        with open(PRODUCTS_FILE, "rb") as f:
+            await i.followup.send("📦 Backup de produtos:", file=discord.File(f, "products.json"), ephemeral=True)
+        for pid in PRODUCTS:
+            for plan_id in PRODUCTS[pid]["plans"].keys():
+                path = get_stock_file_path(pid, plan_id)
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        await i.followup.send(file=discord.File(f, os.path.basename(path)), ephemeral=True)
+        await i.followup.send("✅ Backup completo enviado!", ephemeral=True)
 
-@bot.slash_command(name="definirproduto", description="Vitrine de um produto")
-async def definirproduto(ctx, produto: discord.Option(str, "Nome", autocomplete=lambda c: [p["name"] for p in PRODUCTS.values()])):
-    pid = next((k for k, v in PRODUCTS.items() if v["name"] == produto), None)
-    if not pid: return await ctx.respond("Não encontrado!", ephemeral=True)
-    p = PRODUCTS[pid]
-    emb = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
-    for plid, pl in p["plans"].items():
-        emb.add_field(name=f"**{pl['name']}**", value=f"```R$ {pl['price']:.2f} | Estoque: {get_available_stock_count(pid, plid)}```", inline=True)
-    await ctx.respond(embed=emb, view=ProductBuyPlanSelectView(pid))
+@bot.event
+async def on_ready():
+    print(f"Bot Online: {bot.user}")
 
-@bot.slash_command(name="produtos", description="Catálogo")
+# --- Comandos de Barra ---
+@bot.slash_command(name="definirproduto", description="Envia a vitrine de um produto específico no canal")
+async def definirproduto(ctx, produto: discord.Option(str, "Escolha o produto", autocomplete=lambda ctx: [p["name"] for p in PRODUCTS.values()])):
+    if not PRODUCTS: return await ctx.respond("Nenhum produto cadastrado!", ephemeral=True)
+    product_id = next((pid for pid, p in PRODUCTS.items() if p["name"] == produto), None)
+    if not product_id: return await ctx.respond("Produto não encontrado!", ephemeral=True)
+    p = PRODUCTS[product_id]
+    embed = discord.Embed(title=f"💎 {p['name']}", description=p['description'], color=0x2f3136)
+    total_stock = get_total_product_stock_count(product_id)
+    embed.add_field(name="📦 Estoque Total", value=f"``` {total_stock} unidades ```", inline=True)
+    embed.set_footer(text="🛒 Selecione o plano abaixo para comprar")
+    await ctx.respond(embed=embed, view=ProductBuyPlanSelectView(product_id))
+
+@bot.slash_command(name="produtos", description="Mostra todos os produtos da loja")
 async def produtos(ctx):
-    if not PRODUCTS: return await ctx.respond("Vazio!", ephemeral=True)
-    await ctx.respond("Selecione um produto:", view=ProductSelectView())
+    if not PRODUCTS: return await ctx.respond("Nenhum produto cadastrado!", ephemeral=True)
+    await ctx.respond("Selecione um produto para ver os detalhes:", view=ProductSelectView(), ephemeral=False)
 
-@bot.slash_command(name="painel", description="Painel Admin")
+@bot.slash_command(name="estoque_artificial", description="Adiciona itens repetidos ao estoque")
+async def estoque_artificial(ctx):
+    if ctx.author.id != OWNER_ID: return await ctx.respond("❌ Apenas o dono!", ephemeral=True)
+    opts = [discord.SelectOption(label=p["name"], value=pid) for pid, p in PRODUCTS.items()]
+    if not opts: return await ctx.respond("Crie um produto primeiro!", ephemeral=True)
+    select = Select(placeholder="Escolha o produto...", options=opts)
+    async def sel_cb(i):
+        selected_pid = select.values[0]
+        await i.response.send_message(f"Estoque artificial para **{PRODUCTS[selected_pid]['name']}**:", view=AdminProductStockPlanSelectView(selected_pid, ArtificialStockModal), ephemeral=True)
+    select.callback = sel_cb
+    view = View(); view.add_item(select)
+    await ctx.respond("Selecione o produto para estoque artificial:", view=view, ephemeral=True)
+
+@bot.slash_command(name="painel", description="Abre o painel administrativo da loja")
 async def painel(ctx):
-    if ctx.author.id != OWNER_ID: return await ctx.respond("Apenas o dono!", ephemeral=True)
-    await ctx.respond("🛠️ **Painel Administrativo**", view=AdminPanelMainView(), ephemeral=True)
+    if ctx.author.id != OWNER_ID: return await ctx.respond(f"❌ Apenas o dono pode acessar.", ephemeral=True)
+    await ctx.respond("🛠️ **Painel Administrativo da Loja**", view=AdminPanelMainView(), ephemeral=True)
+
+@bot.slash_command(name="backup", description="Faz backup dos dados da loja")
+async def backup(ctx):
+    if ctx.author.id != OWNER_ID: return await ctx.respond("❌ Apenas o dono pode usar este comando.", ephemeral=True)
+    await ctx.defer(ephemeral=True)
+    with open(PRODUCTS_FILE, "rb") as f:
+        await ctx.followup.send("📦 Backup de produtos:", file=discord.File(f, "products.json"), ephemeral=True)
+    for pid in PRODUCTS:
+        for plan_id in PRODUCTS[pid]["plans"].keys():
+            path = get_stock_file_path(pid, plan_id)
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    await ctx.followup.send(file=discord.File(f, os.path.basename(path)), ephemeral=True)
+    await ctx.followup.send("✅ Backup completo enviado!", ephemeral=True)
 
 @bot.event
 async def on_connect(): await bot.sync_commands()
