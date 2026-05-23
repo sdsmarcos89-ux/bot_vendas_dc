@@ -5,7 +5,7 @@ import asyncio
 # ==========================================
 # CONFIGURAÇÃO - COLOQUE SEU TOKEN AQUI
 # ==========================================
-BOT_TOKEN = 'SEU_TOKEN_AQUI' 
+BOT_TOKEN = 'MTUwNzE1ODAzODI3MDk3MTkwNA.GpXQ_J.0uaTkeZDRML0y5n0r_dM5pR58URWypDNrfwGd8' 
 # ==========================================
 
 # Configuração de Intents (Permissões necessárias no Portal do Desenvolvedor)
